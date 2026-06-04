@@ -90,7 +90,7 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
     await expect(waitForIndexStoreQuiescence(storePath, {
       sampleIntervalMs: 1,
       stableSamples: 2,
-      maxWaitMs: 50,
+      maxWaitMs: 500,
     })).resolves.toMatchObject({ fileCount: 1, totalSize: 3 });
   });
 

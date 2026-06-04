@@ -29,6 +29,7 @@ struct Queries {
     ///   Phase 2 — outside any callback, walk the array and run the heavy queries.
     func dumpAll() throws -> (symbols: Int, refs: Int, rels: Int) {
         emitMeta()
+        emitCap()
 
         // Phase 1: drain names into a flat array.
         var names: [String] = []
@@ -44,6 +45,7 @@ struct Queries {
         var relCount = 0
         var seenUSRs = Set<String>()
         seenUSRs.reserveCapacity(names.count)
+        var indexedFiles = Set<String>()
 
         for name in names {
             let canonicals = db.canonicalOccurrences(ofName: name)
@@ -55,6 +57,7 @@ struct Queries {
                 if seenUSRs.contains(usr) { continue }
                 seenUSRs.insert(usr)
 
+                indexedFiles.insert(occ.location.path)
                 emitSym(occ)
                 symCount += 1
 
@@ -63,6 +66,7 @@ struct Queries {
                 let refs = db.occurrences(ofUSR: usr, roles: .all)
                 for ref in refs {
                     if !includeSystem && ref.location.isSystem { continue }
+                    indexedFiles.insert(ref.location.path)
                     let isDeclOrDef = ref.roles.contains(.declaration) || ref.roles.contains(.definition)
                     if !isDeclOrDef && (ref.roles.contains(.reference) || ref.roles.contains(.call)
                         || ref.roles.contains(.read) || ref.roles.contains(.write)) {
@@ -79,6 +83,7 @@ struct Queries {
             }
         }
 
+        emitUnitMembership(for: indexedFiles)
         emitDone(symbols: symCount, refs: refCount, rels: relCount)
         return (symCount, refCount, relCount)
     }
@@ -119,6 +124,86 @@ struct Queries {
             "refs": refs,
             "rels": rels,
         ])
+    }
+
+    private func emitCap() {
+        write([
+            "t": "cap",
+            "semanticDeltaVersion": 1,
+            "helperVersion": "codegraph-xchelper 1.0.0",
+            "unitFingerprintAlgorithm": "index-unit-v1",
+            "recordKinds": ["unit", "unit_file", "sym", "rel", "ref"],
+            "sourceMembership": true,
+        ])
+    }
+
+    private func emitUnitMembership(for paths: Set<String>) {
+        var unitFiles: [String: Set<String>] = [:]
+        for file in paths {
+            for unitName in db.unitNamesContainingFile(path: file) {
+                unitFiles[unitName, default: []].insert(file)
+            }
+        }
+
+        for unitName in unitFiles.keys.sorted() {
+            let files = Array(unitFiles[unitName] ?? []).sorted()
+            emitUnit(unitName: unitName, files: files)
+            for file in files {
+                emitUnitFile(unitName: unitName, file: file)
+            }
+        }
+    }
+
+    private func emitUnit(unitName: String, files: [String]) {
+        let mainFile = files.first(where: isPrimarySourceFile) ?? files.first
+        var obj: [String: Any] = [
+            "t": "unit",
+            "unit_id": unitName,
+            "fingerprint": fingerprint(unitName: unitName, files: files),
+        ]
+        if let mainFile {
+            obj["main_file"] = relativize(mainFile)
+        }
+        write(obj)
+    }
+
+    private func emitUnitFile(unitName: String, file: String) {
+        write([
+            "t": "unit_file",
+            "unit_id": unitName,
+            "file": relativize(file),
+            "role": unitFileRole(file),
+        ])
+    }
+
+    private func unitFileRole(_ file: String) -> String {
+        if isPrimarySourceFile(file) { return "primary" }
+        if file.contains("/DerivedData/") || file.contains("/Build/") { return "generated" }
+        return "header"
+    }
+
+    private func isPrimarySourceFile(_ file: String) -> Bool {
+        let lower = file.lowercased()
+        return lower.hasSuffix(".m") || lower.hasSuffix(".mm") || lower.hasSuffix(".swift")
+    }
+
+    private func fingerprint(unitName: String, files: [String]) -> String {
+        var parts = [unitName]
+        for file in files.sorted() {
+            let mtime = ((try? FileManager.default.attributesOfItem(atPath: file)[.modificationDate] as? Date) ?? nil)
+                .map { String(Int64($0.timeIntervalSince1970 * 1000)) } ?? "0"
+            parts.append("\(file):\(mtime)")
+        }
+        return String(format: "%016llx", fnv1a64(parts.joined(separator: "\u{0}")))
+    }
+
+    private func fnv1a64(_ string: String) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return hash
     }
 
     private func emitSym(_ occ: SymbolOccurrence) {

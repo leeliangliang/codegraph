@@ -45,6 +45,29 @@ cd "$SWIFT_PROJ"
 # from cache, only the per-target build is fresh).
 rm -rf .build
 
+# Swift 6.0.3's indexstore-db tag has a C enum constant written as `1 << 63`.
+# Newer Apple Clang rejects that while compiling the C++ shim because the left
+# side is a 32-bit int. Patch the transient SwiftPM checkout to use an unsigned
+# 64-bit literal; this is build-artifact-only and keeps the pinned dependency.
+echo "[build-mac-objc-helper] resolving Swift dependencies…"
+swift package resolve
+INDEXSTORE_HEADER=".build/checkouts/indexstore-db/lib/CIndexStoreDB/include/CIndexStoreDB/CIndexStoreDB.h"
+if [[ -f "$INDEXSTORE_HEADER" ]]; then
+  chmod u+w "$INDEXSTORE_HEADER"
+  python3 - "$INDEXSTORE_HEADER" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+patched = text.replace('INDEXSTOREDB_SYMBOL_ROLE_CANONICAL = 1 << 63,', 'INDEXSTOREDB_SYMBOL_ROLE_CANONICAL = 1ULL << 63,')
+if patched != text:
+    path.write_text(patched)
+PY
+else
+  echo "[build-mac-objc-helper] indexstore-db header not found at $INDEXSTORE_HEADER" >&2
+  exit 1
+fi
+
 echo "[build-mac-objc-helper] building arm64 slice…"
 swift build -c release --arch arm64
 

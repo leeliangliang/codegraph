@@ -122,14 +122,13 @@ describe('Semantic ObjC delta planner', () => {
     expect(planSemanticObjcDelta({
       capability,
       storedUnits: [],
-      currentUnits: [unit('u1', 'f1'), unit('u2', 'f2')],
+      currentUnits: [unit('u1', 'f1')],
       currentUnitFiles: [
         unitFile('u1', 'A.m'),
-        unitFile('u1', 'Shared.h', 'header'),
-        unitFile('u2', 'B.m'),
-        unitFile('u2', 'Shared.h', 'header'),
+        unitFile('u1', 'A.m', 'header'),
       ],
-    })).toMatchObject({ mode: 'needs-reconcile', reason: 'shared-header-ambiguity' });
+      uncertainOwnership: true,
+    })).toMatchObject({ mode: 'needs-reconcile', reason: 'semantic-ownership-uncertain' });
   });
 
   it('falls back when stored fingerprints use a different algorithm', () => {

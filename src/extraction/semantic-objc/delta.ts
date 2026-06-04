@@ -46,7 +46,6 @@ export function planSemanticObjcDelta(input: SemanticObjcDeltaPlanInput): Semant
   const currentById = new Map(input.currentUnits.map((unit) => [unit.unit_id, unit]));
   const storedById = new Map(input.storedUnits.map((unit) => [unit.unitId, unit]));
   const filesByUnit = new Map<string, Set<string>>();
-  const unitsByHeader = new Map<string, Set<string>>();
   for (const unitFile of input.currentUnitFiles) {
     if (!currentById.has(unitFile.unit_id)) {
       return { ...empty, mode: 'needs-reconcile', reason: 'unit-file-without-unit' };
@@ -54,17 +53,6 @@ export function planSemanticObjcDelta(input: SemanticObjcDeltaPlanInput): Semant
     const files = filesByUnit.get(unitFile.unit_id) ?? new Set<string>();
     files.add(unitFile.file);
     filesByUnit.set(unitFile.unit_id, files);
-    if (unitFile.role === 'header') {
-      const units = unitsByHeader.get(unitFile.file) ?? new Set<string>();
-      units.add(unitFile.unit_id);
-      unitsByHeader.set(unitFile.file, units);
-    }
-  }
-
-  for (const units of unitsByHeader.values()) {
-    if (units.size > 1) {
-      return { ...empty, mode: 'needs-reconcile', reason: 'shared-header-ambiguity' };
-    }
   }
 
   for (const unit of input.currentUnits) {

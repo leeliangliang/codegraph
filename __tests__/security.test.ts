@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock } from '../src/utils';
+import { FileLock, validateProjectPath } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -186,6 +186,36 @@ describe('Path Traversal Prevention', () => {
   });
 });
 
+describe('validateProjectPath — sensitive directory blocking', () => {
+  // POSIX-only: on Windows '/etc' resolves to C:\etc (non-existent), not a
+  // sensitive dir — the Windows case is covered by the win32-gated test below.
+  it.runIf(process.platform !== 'win32')('blocks POSIX system directories (exact match)', () => {
+    expect(validateProjectPath('/')).toMatch(/sensitive system directory/i);
+    expect(validateProjectPath('/etc')).toMatch(/sensitive system directory/i);
+  });
+
+  it('allows a normal, existing directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-validate-'));
+    try {
+      expect(validateProjectPath(dir)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // SENSITIVE_PATHS stores the Windows entries lowercase and validateProjectPath
+  // matches via resolved.toLowerCase(), so 'C:\\Windows' and 'c:\\windows' are
+  // both blocked. path.resolve is platform-specific, so this only runs on Windows.
+  it.runIf(process.platform === 'win32')(
+    'blocks Windows system directories regardless of case',
+    () => {
+      expect(validateProjectPath('C:\\Windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('c:\\windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
+    }
+  );
+});
+
 describe('MCP Input Validation', () => {
   let testDir: string;
   let cg: CodeGraph;
@@ -243,10 +273,36 @@ describe('MCP Input Validation', () => {
     expect(result.content[0].text).toContain('non-empty string');
   });
 
-  it('should reject non-string task in codegraph_context', async () => {
-    const result = await handler.execute('codegraph_context', { task: undefined });
+  it('should reject non-string query in codegraph_explore', async () => {
+    const result = await handler.execute('codegraph_explore', { query: undefined });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
+  });
+
+  it('should truncate oversized tool output', async () => {
+    // Force a huge result set through codegraph_search; the response must be
+    // truncated with the sentinel rather than flooding the agent's context.
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      node: {
+        id: `n${i}`,
+        name: `symbol_${i}_${'x'.repeat(40)}`,
+        kind: 'function',
+        filePath: `src/very/deep/path/file_${i}.ts`,
+        startLine: 1,
+        endLine: 2,
+        language: 'typescript',
+      },
+      score: 1,
+    }));
+    const fakeCg = {
+      searchNodes: () => many,
+    };
+    const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
+
+    const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('... (output truncated)');
   });
 
   it('should reject non-string symbol in codegraph_impact', async () => {
@@ -273,6 +329,34 @@ describe('MCP Input Validation', () => {
     const result = await handler.execute('codegraph_search', { query: 'example', limit: -5 });
     expect(result.isError).toBeFalsy();
   });
+
+  // #230: getCodeGraph must reject a sensitive system directory passed as
+  // projectPath before opening it. The error surfaces through execute()'s
+  // catch as an isError result. /etc is sensitive on POSIX; C:\Windows on
+  // Windows (path.resolve is platform-specific, so each case is gated).
+  it.runIf(process.platform !== 'win32')(
+    'rejects a sensitive POSIX projectPath (/etc) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: '/etc',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'rejects a sensitive Windows projectPath (C:\\Windows) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: 'C:\\Windows',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
 });
 
 describe('Atomic Writes', () => {
@@ -487,96 +571,5 @@ describe('Symlink Cycle Detection', () => {
     // Should not throw
     const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
-  });
-});
-
-describe('Session marker symlink resistance', () => {
-  // The marker write lives in src/mcp/tools.ts behind handleContext. We exercise
-  // it end-to-end via ToolHandler.execute so the test exercises the same code
-  // path Claude Code drives. The session id is per-test so other parallel test
-  // runs can't collide with the marker file we plant a symlink at.
-  const SESSION_ID = `cg-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const crypto = require('crypto') as typeof import('crypto');
-  const hash = crypto.createHash('md5').update(SESSION_ID).digest('hex').slice(0, 16);
-  const markerPath = path.join(os.tmpdir(), `codegraph-consulted-${hash}`);
-
-  let projectDir: string;
-  let victimDir: string;
-  let victimFile: string;
-
-  beforeEach(async () => {
-    projectDir = createTempDir();
-    victimDir = createTempDir();
-    victimFile = path.join(victimDir, 'private.txt');
-    fs.writeFileSync(victimFile, 'SECRET-DO-NOT-OVERWRITE\n');
-    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
-
-    // A real .codegraph/ has to exist for handleContext to get past the
-    // "not initialized" guard — index a tiny fixture so the call reaches the
-    // marker write step rather than short-circuiting on missing project state.
-    fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
-    const cg = await CodeGraph.init(projectDir);
-    await cg.indexAll();
-    cg.close();
-  });
-
-  afterEach(() => {
-    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
-    cleanupTempDir(projectDir);
-    cleanupTempDir(victimDir);
-  });
-
-  it('does not follow a pre-planted symlink at the marker path', async () => {
-    // Skip on platforms where the user can't create symlinks (Windows without
-    // dev mode + admin). The CWE-59 risk we're guarding against doesn't apply
-    // when symlinks aren't creatable, so the skip is correct, not a gap.
-    try {
-      fs.symlinkSync(victimFile, markerPath);
-    } catch {
-      return;
-    }
-
-    const cg = await CodeGraph.open(projectDir);
-    const handler = new ToolHandler(cg);
-    process.env.CLAUDE_SESSION_ID = SESSION_ID;
-    try {
-      await handler.execute('codegraph_context', { task: 'find x' });
-    } finally {
-      delete process.env.CLAUDE_SESSION_ID;
-      cg.close();
-    }
-
-    // The victim file's contents must be untouched — the old writeFileSync
-    // path would have followed the symlink and written an ISO timestamp here.
-    expect(fs.readFileSync(victimFile, 'utf8')).toBe('SECRET-DO-NOT-OVERWRITE\n');
-
-    // And the marker path itself must still be the symlink we planted —
-    // no fallback path that quietly unlinked + recreated it (which would
-    // also work, but is a behavior we don't want to silently rely on).
-    expect(fs.lstatSync(markerPath).isSymbolicLink()).toBe(true);
-  });
-
-  it('writes the marker file with 0o600 perms on a clean path', async () => {
-    // No symlink planted — happy path. Verifies the new openSync(mode: 0o600)
-    // call is what actually lands on disk (regression guard for the perm
-    // tightening that came with the O_NOFOLLOW fix).
-    const cg = await CodeGraph.open(projectDir);
-    const handler = new ToolHandler(cg);
-    process.env.CLAUDE_SESSION_ID = SESSION_ID;
-    try {
-      await handler.execute('codegraph_context', { task: 'find x' });
-    } finally {
-      delete process.env.CLAUDE_SESSION_ID;
-      cg.close();
-    }
-
-    expect(fs.existsSync(markerPath)).toBe(true);
-    // chmod's low 9 bits — strip the file-type bits for a clean compare.
-    // Windows can't enforce 0o600 in the POSIX sense; skip the assertion
-    // there since the underlying OS will normalize the mode anyway.
-    if (process.platform !== 'win32') {
-      const mode = fs.statSync(markerPath).mode & 0o777;
-      expect(mode).toBe(0o600);
-    }
   });
 });

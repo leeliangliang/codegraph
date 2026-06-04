@@ -227,8 +227,9 @@ export async function mergeFromHelper(
 
   await handle.wait();
 
+  const deltaUnitFiles = canonicaliseUnitFiles(unitFileBuffer, helperRoot, projectRoot);
+  let deltaSafe = false;
   if (capRecord) {
-    const deltaUnitFiles = canonicaliseUnitFiles(unitFileBuffer, helperRoot, projectRoot);
     const plan = planSemanticObjcDelta({
       capability: capRecord,
       currentUnits: unitBuffer,
@@ -237,7 +238,7 @@ export async function mergeFromHelper(
       uncertainOwnership: hasAmbiguousPrimaryOwnership(deltaUnitFiles),
     });
     const rewrite = applySemanticObjcDeltaRewrite(db, plan);
-    if (rewrite.mode === 'stale') return summary;
+    deltaSafe = rewrite.mode === 'rewritten';
   }
 
   const matchedSyms: Array<{ nodeId: string; filePath: string; usr: string }> = [];
@@ -276,27 +277,25 @@ export async function mergeFromHelper(
       for (const unitId of seenUnits) {
         deleteUnitFilesStmt.run(unitId);
       }
-      for (const unitFile of unitFileBuffer) {
+      for (const unitFile of deltaUnitFiles) {
         if (!seenUnits.has(unitFile.unit_id)) continue;
-        const filePath = canonicaliseSymPath(unitFile.file, helperRoot, projectRoot);
-        if (filePath === null) continue;
-        insertUnitFileStmt.run(unitFile.unit_id, filePath, unitFile.role);
+        insertUnitFileStmt.run(unitFile.unit_id, unitFile.file, unitFile.role);
         summary.unitFilesMerged++;
       }
-      const primaryUnitsByFile = new Map<string, string[]>();
-      for (const unitFile of unitFileBuffer) {
-        if (unitFile.role !== 'primary' || !seenUnits.has(unitFile.unit_id)) continue;
-        const filePath = canonicaliseSymPath(unitFile.file, helperRoot, projectRoot);
-        if (filePath === null) continue;
-        const units = primaryUnitsByFile.get(filePath) ?? [];
-        units.push(unitFile.unit_id);
-        primaryUnitsByFile.set(filePath, units);
-      }
-      for (const sym of matchedSyms) {
-        const units = primaryUnitsByFile.get(sym.filePath);
-        if (!units || units.length !== 1) continue;
-        insertOwnershipStmt.run(sym.nodeId, units[0], sym.filePath, sym.usr);
-        summary.ownershipRowsMerged++;
+      if (deltaSafe) {
+        const primaryUnitsByFile = new Map<string, string[]>();
+        for (const unitFile of deltaUnitFiles) {
+          if (unitFile.role !== 'primary' || !seenUnits.has(unitFile.unit_id)) continue;
+          const units = primaryUnitsByFile.get(unitFile.file) ?? [];
+          units.push(unitFile.unit_id);
+          primaryUnitsByFile.set(unitFile.file, units);
+        }
+        for (const sym of matchedSyms) {
+          const units = primaryUnitsByFile.get(sym.filePath);
+          if (!units || units.length !== 1) continue;
+          insertOwnershipStmt.run(sym.nodeId, units[0], sym.filePath, sym.usr);
+          summary.ownershipRowsMerged++;
+        }
       }
     }
 

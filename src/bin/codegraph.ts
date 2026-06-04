@@ -7,6 +7,7 @@
  * Usage:
  *   codegraph                    Run interactive installer (when no args)
  *   codegraph install            Run interactive installer
+ *   codegraph uninstall          Remove CodeGraph from your agents
  *   codegraph init [path]        Initialize CodeGraph in a project
  *   codegraph uninit [path]      Remove CodeGraph from a project
  *   codegraph index [path]       Index all files in the project
@@ -15,6 +16,9 @@
  *   codegraph query <search>     Search for symbols
  *   codegraph files [options]    Show project file structure
  *   codegraph context <task>     Build context for a task
+ *   codegraph callers <symbol>   Find what calls a function/method
+ *   codegraph callees <symbol>   Find what a function/method calls
+ *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
  */
 
@@ -22,11 +26,13 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
+import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { FileLock } from '../utils';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -74,6 +80,13 @@ if (nodeMajor < MIN_NODE_MAJOR) {
   }
   // Override active — banner shown for visibility, continuing.
 }
+
+// Re-exec with V8's `--liftoff-only` if it isn't already set, so tree-sitter's
+// large WASM grammars never hit the turboshaft Zone OOM (`Fatal process out of
+// memory: Zone`) on Node >= 22. No-op under the bundled launcher, which already
+// passes the flag. Must run before any grammar (in the parse worker, which
+// inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
+relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
@@ -404,8 +417,8 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
  */
 program
   .command('init [path]')
-  .description('Initialize CodeGraph in a project directory')
-  .option('-i, --index', 'Run initial indexing after initialization')
+  .description('Initialize CodeGraph in a project directory and build the initial index')
+  .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
@@ -417,15 +430,6 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        // Re-run agent surface wiring so re-running `init` is the
-        // documented way to recover a project that's missing its
-        // Cursor rules file (or future per-agent project surfaces).
-        try {
-          const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-          for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-            clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-          }
-        } catch { /* non-fatal */ }
         try {
           const { offerWatchFallback } = await import('../installer');
           await offerWatchFallback(clack, projectPath);
@@ -438,41 +442,24 @@ program
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
-      // Bootstrap project-local surfaces for any agent that's
-      // configured globally (Cursor needs ./.cursor/rules/codegraph.mdc
-      // to actually prefer codegraph over native grep). Silent when
-      // there's nothing to write.
-      try {
-        const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-        for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-          clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        clack.log.warn(`Skipped wiring project-local agent surfaces: ${msg}`);
-      }
-
-      if (options.index) {
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
-          await progress.stop();
-        }
-
-        printIndexResult(clack, result, projectPath);
+      // Indexing runs by default now. The legacy -i/--index flag is still
+      // accepted (so existing muscle memory and scripts don't break) but is a
+      // no-op — initializing always builds the initial index.
+      let result: IndexResult;
+      if (options.verbose) {
+        result = await cg.indexAll({
+          onProgress: createVerboseProgress(),
+          verbose: true,
+        });
       } else {
-        clack.log.info('Run "codegraph index" to index the project');
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        result = await cg.indexAll({
+          onProgress: progress.onProgress,
+        });
+        await progress.stop();
       }
+      printIndexResult(clack, result, projectPath);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -727,11 +714,22 @@ program
   .option('-j, --json', 'Output as JSON')
   .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    // The directory the user actually ran from, before walking up to the index
+    // root. Used to detect when the resolved index lives in a different git
+    // working tree (e.g. a nested worktree borrowing the main checkout's index).
+    const startPath = path.resolve(pathArg || process.cwd());
+    const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
       if (!isInitialized(projectPath)) {
         if (options.json) {
-          console.log(JSON.stringify({ initialized: false, projectPath }));
+          console.log(JSON.stringify({
+            initialized: false,
+            version: packageJson.version,
+            projectPath,
+            indexPath: getCodeGraphDir(projectPath),
+            lastIndexed: null,
+          }));
           return;
         }
         console.log(chalk.bold('\nCodeGraph Status\n'));
@@ -751,9 +749,13 @@ program
 
       // JSON output mode
       if (options.json) {
+        const lastIndexedMs = cg.getLastIndexedAt();
         console.log(JSON.stringify({
           initialized: true,
+          version: packageJson.version,
           projectPath,
+          indexPath: getCodeGraphDir(projectPath),
+          lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
@@ -768,6 +770,9 @@ program
             modified: changes.modified.length,
             removed: changes.removed.length,
           },
+          worktreeMismatch: worktreeMismatch
+            ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
+            : null,
         }));
         cg.destroy();
         return;
@@ -777,6 +782,9 @@ program
 
       // Project info
       console.log(chalk.cyan('Project:'), projectPath);
+      if (worktreeMismatch) {
+        warn(worktreeMismatchWarning(worktreeMismatch));
+      }
       console.log();
 
       // Index stats
@@ -875,9 +883,19 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
-      const results = cg.searchNodes(search, {
+      const rawResults = cg.searchNodes(search, {
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
+      });
+
+      // Mirror the MCP search down-rank so the CLI also surfaces the
+      // hand-written implementation before protobuf/gRPC scaffolding
+      // when both share a name. See extraction/generated-detection.ts.
+      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const results = [...rawResults].sort((a, b) => {
+        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        return aGen - bGen;
       });
 
       if (options.json) {
@@ -1122,52 +1140,6 @@ function printFileTree(
 }
 
 /**
- * codegraph context <task>
- */
-program
-  .command('context <task>')
-  .description('Build context for a task (outputs markdown)')
-  .option('-p, --path <path>', 'Project path')
-  .option('-n, --max-nodes <number>', 'Maximum nodes to include', '50')
-  .option('-c, --max-code <number>', 'Maximum code blocks', '10')
-  .option('--no-code', 'Exclude code blocks')
-  .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
-  .action(async (task: string, options: {
-    path?: string;
-    maxNodes?: string;
-    maxCode?: string;
-    code?: boolean;
-    format?: string;
-  }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-
-      const context = await cg.buildContext(task, {
-        maxNodes: parseInt(options.maxNodes || '50', 10),
-        maxCodeBlocks: parseInt(options.maxCode || '10', 10),
-        includeCode: options.code !== false,
-        format: options.format as 'markdown' | 'json',
-      });
-
-      // Output the context
-      console.log(context);
-
-      cg.destroy();
-    } catch (err) {
-      error(`Failed to build context: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
  * codegraph serve
  */
 program
@@ -1213,8 +1185,8 @@ program
 }
 `));
         console.error('Available tools:');
+        console.error(chalk.cyan('  codegraph_explore') + '   - Primary: source of the relevant symbols for any question');
         console.error(chalk.cyan('  codegraph_search') + '    - Search for code symbols');
-        console.error(chalk.cyan('  codegraph_context') + '   - Build context for a task');
         console.error(chalk.cyan('  codegraph_callers') + '   - Find callers of a symbol');
         console.error(chalk.cyan('  codegraph_callees') + '   - Find what a symbol calls');
         console.error(chalk.cyan('  codegraph_impact') + '    - Analyze impact of changes');
@@ -1254,6 +1226,264 @@ program
       success('Removed lock file. You can now run indexing again.');
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph callers <symbol>
+ *
+ * CLI parity with the MCP graph tools (codegraph_callers/callees/impact) so the
+ * traversal queries work in scripts, CI, and git hooks without a running MCP
+ * server.
+ */
+program
+  .command('callers <symbol>')
+  .description('Find all functions/methods that call a specific symbol')
+  .option('-p, --path <path>', 'Project path')
+  .option('-l, --limit <number>', 'Maximum results', '20')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const limit = parseInt(options.limit || '20', 10);
+
+      const matches = cg.searchNodes(symbol, { limit: 50 });
+      if (matches.length === 0) {
+        info(`Symbol "${symbol}" not found`);
+        cg.destroy();
+        return;
+      }
+
+      const seen = new Set<string>();
+      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+
+      for (const match of matches) {
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        if (!exactMatch && matches.length > 1) continue;
+        for (const c of cg.getCallers(match.node.id)) {
+          if (!seen.has(c.node.id)) {
+            seen.add(c.node.id);
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+          }
+        }
+      }
+
+      // Fallback: if exact filter removed everything, use the top match
+      if (allCallers.length === 0 && matches[0]) {
+        for (const c of cg.getCallers(matches[0].node.id)) {
+          if (!seen.has(c.node.id)) {
+            seen.add(c.node.id);
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+          }
+        }
+      }
+
+      const limited = allCallers.slice(0, limit);
+
+      if (options.json) {
+        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
+      } else if (limited.length === 0) {
+        info(`No callers found for "${symbol}"`);
+      } else {
+        console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
+        for (const node of limited) {
+          const loc = node.startLine ? `:${node.startLine}` : '';
+          console.log(
+            chalk.cyan(node.kind.padEnd(12)) +
+            chalk.white(node.name)
+          );
+          console.log(chalk.dim(`  ${node.filePath}${loc}`));
+          console.log();
+        }
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`callers failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph callees <symbol>
+ */
+program
+  .command('callees <symbol>')
+  .description('Find all functions/methods that a specific symbol calls')
+  .option('-p, --path <path>', 'Project path')
+  .option('-l, --limit <number>', 'Maximum results', '20')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const limit = parseInt(options.limit || '20', 10);
+
+      const matches = cg.searchNodes(symbol, { limit: 50 });
+      if (matches.length === 0) {
+        info(`Symbol "${symbol}" not found`);
+        cg.destroy();
+        return;
+      }
+
+      const seen = new Set<string>();
+      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+
+      for (const match of matches) {
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        if (!exactMatch && matches.length > 1) continue;
+        for (const c of cg.getCallees(match.node.id)) {
+          if (!seen.has(c.node.id)) {
+            seen.add(c.node.id);
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+          }
+        }
+      }
+
+      if (allCallees.length === 0 && matches[0]) {
+        for (const c of cg.getCallees(matches[0].node.id)) {
+          if (!seen.has(c.node.id)) {
+            seen.add(c.node.id);
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+          }
+        }
+      }
+
+      const limited = allCallees.slice(0, limit);
+
+      if (options.json) {
+        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
+      } else if (limited.length === 0) {
+        info(`No callees found for "${symbol}"`);
+      } else {
+        console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
+        for (const node of limited) {
+          const loc = node.startLine ? `:${node.startLine}` : '';
+          console.log(
+            chalk.cyan(node.kind.padEnd(12)) +
+            chalk.white(node.name)
+          );
+          console.log(chalk.dim(`  ${node.filePath}${loc}`));
+          console.log();
+        }
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`callees failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph impact <symbol>
+ */
+program
+  .command('impact <symbol>')
+  .description('Analyze what code is affected by changing a symbol')
+  .option('-p, --path <path>', 'Project path')
+  .option('-d, --depth <number>', 'Traversal depth', '2')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+
+      const matches = cg.searchNodes(symbol, { limit: 50 });
+      if (matches.length === 0) {
+        info(`Symbol "${symbol}" not found`);
+        cg.destroy();
+        return;
+      }
+
+      // Merge impact subgraphs across all exact-matching symbols
+      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
+      const seenEdges = new Set<string>();
+      let edgeCount = 0;
+
+      for (const match of matches) {
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        if (!exactMatch && matches.length > 1) continue;
+        const impact = cg.getImpactRadius(match.node.id, depth);
+        for (const [id, n] of impact.nodes) {
+          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
+        }
+        for (const e of impact.edges) {
+          const key = `${e.source}->${e.target}:${e.kind}`;
+          if (!seenEdges.has(key)) {
+            seenEdges.add(key);
+            edgeCount++;
+          }
+        }
+      }
+
+      // Fallback to top match if exact filter removed everything
+      if (mergedNodes.size === 0 && matches[0]) {
+        const impact = cg.getImpactRadius(matches[0].node.id, depth);
+        for (const [id, n] of impact.nodes) {
+          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
+        }
+        edgeCount = impact.edges.length;
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify({
+          symbol,
+          depth,
+          nodeCount: mergedNodes.size,
+          edgeCount,
+          affected: Array.from(mergedNodes.values()),
+        }, null, 2));
+      } else if (mergedNodes.size === 0) {
+        info(`No affected symbols found for "${symbol}"`);
+      } else {
+        console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${mergedNodes.size} affected symbols:\n`));
+
+        // Group by file
+        const byFile = new Map<string, Array<{ name: string; kind: string; startLine?: number }>>();
+        for (const node of mergedNodes.values()) {
+          const list = byFile.get(node.filePath) || [];
+          list.push({ name: node.name, kind: node.kind, startLine: node.startLine });
+          byFile.set(node.filePath, list);
+        }
+
+        for (const [file, nodes] of byFile) {
+          console.log(chalk.cyan(file));
+          for (const node of nodes) {
+            const loc = node.startLine ? `:${node.startLine}` : '';
+            console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
+          }
+          console.log();
+        }
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
@@ -1644,6 +1874,11 @@ program
           console.log(`  Enriched:            ${chalk.green(formatNumber(summary.symsMerged))} (usr populated)`);
           console.log(`  Outside project:     ${formatNumber(summary.symsOutsideProject)} (DerivedData / frameworks)`);
           console.log(`  No matching node:    ${formatNumber(summary.symsNotMatched)}`);
+          console.log(chalk.dim('Units (for incremental refresh)'));
+          console.log(`  Seen:                ${formatNumber(summary.unitsSeen)}`);
+          console.log(`  Units stored:        ${chalk.green(formatNumber(summary.unitsMerged))}`);
+          console.log(`  Unit files stored:   ${chalk.green(formatNumber(summary.unitFilesMerged))}`);
+          console.log(`  Ownership rows:      ${chalk.green(formatNumber(summary.ownershipRowsMerged))}`);
           console.log(chalk.dim('Relations (override / base / extended)'));
           console.log(`  Seen:                ${formatNumber(summary.relsSeen)}`);
           console.log(`  Edges added:         ${chalk.green(formatNumber(summary.relsMerged))}`);
@@ -1663,6 +1898,42 @@ program
       }
     } catch (err) {
       error(`enrich-objc failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph uninstall
+ *
+ * Inverse of `install`. Removes the codegraph MCP server entry,
+ * instructions block, and permissions from every agent (or a
+ * `--target` subset). Prompts global-vs-local when not given. Does NOT
+ * delete the `.codegraph/` index — that's `codegraph uninit`.
+ */
+program
+  .command('uninstall')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
+  .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
+  .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
+  .action(async (opts: {
+    target?: string;
+    location?: string;
+    yes?: boolean;
+  }) => {
+    const { runUninstaller } = await import('../installer');
+    if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+      error(`--location must be "global" or "local" (got "${opts.location}").`);
+      process.exit(1);
+    }
+    try {
+      await runUninstaller({
+        target: opts.target,
+        location: opts.location as 'global' | 'local' | undefined,
+        yes: opts.yes,
+      });
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
   });
