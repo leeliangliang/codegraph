@@ -184,7 +184,7 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  /** Locks older than this are considered stale regardless of PID status */
+  /** Dead or malformed locks older than this are considered stale. Live owner PIDs never age out. */
   private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
   constructor(lockPath: string) {
@@ -203,15 +203,26 @@ export class FileLock {
         const stat = fs.statSync(this.lockPath);
         const lockAge = Date.now() - stat.mtimeMs;
 
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // A live owner keeps the lock regardless of age. Semantic enrichment can
+        // legitimately run for several minutes; timing out a live PID would let a
+        // second writer enter and defeat the graph write lock.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Dead-process locks are stale. For malformed lock files, keep a short
+        // grace window so a concurrent writer creating the file is not removed
+        // just because the content was temporarily unreadable.
+        if (isNaN(pid) && lockAge < FileLock.STALE_TIMEOUT_MS) {
+          throw new Error(
+            'CodeGraph database is locked by another process. ' +
+            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+          );
+        }
+
         fs.unlinkSync(this.lockPath);
       } catch (err) {
         if (err instanceof Error && err.message.includes('locked by another')) {

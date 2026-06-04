@@ -21,6 +21,16 @@ import { watchDisabledReason } from '../sync';
 import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
 import { tools, ToolHandler } from './tools';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
+import {
+  SemanticObjcIndexStoreWatcher,
+  discoverIndexStorePath,
+  inferSemanticObjcSourceRoot,
+  locateHelperBinary,
+  parseSemanticObjcWatchConfig,
+  type SemanticObjcIndexStoreWatcherOptions,
+  type SemanticObjcWatchConfig,
+} from '../extraction/semantic-objc';
+import type { SemanticObjcStatus } from '../extraction/semantic-objc/state';
 
 /**
  * Convert a file:// URI to a filesystem path.
@@ -60,6 +70,28 @@ const PROTOCOL_VERSION = '2024-11-05';
  */
 const ROOTS_LIST_TIMEOUT_MS = 5000;
 
+export function isSemanticObjcGraphIdle(cg: Pick<CodeGraph, 'isIndexing' | 'hasPendingWatchSync'>): boolean {
+  return !cg.isIndexing() && !cg.hasPendingWatchSync();
+}
+
+export async function resolveSemanticObjcStorePathForProject(
+  config: SemanticObjcWatchConfig,
+  projectRoot: string,
+  repoRoot = path.resolve(__dirname, '../..'),
+  files?: ReturnType<CodeGraph['getFiles']>
+): Promise<{ helperPath: string; storePath: string; sourceRoot: string }> {
+  const helperPath = config.helperPath ?? locateHelperBinary(repoRoot);
+  if (!helperPath) {
+    throw new Error('semantic-helper-not-found');
+  }
+  const sourceRoot = inferSemanticObjcSourceRoot(projectRoot, files);
+  return {
+    helperPath,
+    sourceRoot,
+    storePath: config.storePath ?? await discoverIndexStorePath(helperPath, sourceRoot),
+  };
+}
+
 /**
  * Extract the first usable filesystem path from a `roots/list` result.
  * Shape per MCP spec: `{ roots: [{ uri: "file:///path", name?: string }] }`.
@@ -95,9 +127,12 @@ export class MCPServer {
   // Guards the one-shot deferred resolution (roots/list or cwd) so we don't
   // re-issue roots/list on every tool call.
   private rootsAttempted = false;
+  private semanticObjcConfig: SemanticObjcWatchConfig;
+  private semanticObjcWatcher: SemanticObjcIndexStoreWatcher | null = null;
 
-  constructor(projectPath?: string) {
+  constructor(projectPath?: string, options: { semanticObjc?: unknown } = {}) {
     this.projectPath = projectPath || null;
+    this.semanticObjcConfig = parseSemanticObjcWatchConfig(options.semanticObjc);
     this.transport = new StdioTransport();
     // Create ToolHandler eagerly — cross-project queries work even without a default project
     this.toolHandler = new ToolHandler(null);
@@ -151,7 +186,7 @@ export class MCPServer {
     try {
       this.cg = await CodeGraph.open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
+      void this.startWatching();
     } catch (err) {
       // Log the error so transient failures are diagnosable (see issue #47)
       const msg = err instanceof Error ? err.message : String(err);
@@ -209,7 +244,7 @@ export class MCPServer {
       this.cg = CodeGraph.openSync(resolvedRoot);
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
+      void this.startWatching();
     } catch {
       // Still failing — will retry on next tool call
     }
@@ -241,7 +276,7 @@ export class MCPServer {
    * Start file watching on the active CodeGraph instance.
    * Logs sync activity to stderr for diagnostics.
    */
-  private startWatching(): void {
+  private async startWatching(): Promise<void> {
     if (!this.cg) return;
 
     // When the watcher is intentionally disabled (e.g. WSL2 /mnt drives, or
@@ -277,6 +312,69 @@ export class MCPServer {
         '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
       );
     }
+
+    await this.startSemanticObjcWatching();
+  }
+
+  private async startSemanticObjcWatching(): Promise<void> {
+    const baseConfig = this.semanticObjcConfig;
+    if (!baseConfig.enabled || !baseConfig.watchIndexStore) return;
+    const cg = this.cg;
+    const projectRoot = this.projectPath;
+    if (!cg || !projectRoot) return;
+
+    let resolved: { helperPath: string; storePath: string; sourceRoot: string };
+    try {
+      resolved = await resolveSemanticObjcStorePathForProject(baseConfig, projectRoot, path.resolve(__dirname, '../..'), cg.getFiles());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const reason = msg === 'semantic-helper-not-found'
+        ? msg
+        : `semantic-indexstore-discovery-failed:${msg}`;
+      cg.markSemanticObjcStale(reason);
+      process.stderr.write(`[CodeGraph MCP] Semantic ObjC watch enabled but automatic setup failed for ${projectRoot}: ${reason}\n`);
+      return;
+    }
+
+    const { helperPath, sourceRoot, storePath } = resolved;
+    const config: SemanticObjcWatchConfig = { ...baseConfig, helperPath, storePath };
+    const watcherOptions: SemanticObjcIndexStoreWatcherOptions = {
+      config,
+      lockPath: cg.getGraphLockPath(),
+      isIdle: () => isSemanticObjcGraphIdle(cg),
+      onState: (status, reason) => this.persistSemanticObjcWatchState(cg, status, reason),
+      onSemanticDelta: async () => {
+        await cg.enrichSemanticObjcWithGraphLockHeld({
+          helperPath,
+          storePath,
+          helperSourceRoot: sourceRoot,
+          languages: config.languages,
+        });
+      },
+    };
+    this.semanticObjcWatcher = new SemanticObjcIndexStoreWatcher(watcherOptions);
+    const started = this.semanticObjcWatcher.start();
+    if (started && config.fallback === 'stale-then-idle-reconcile' && cg.getSemanticObjcState().status === 'stale') {
+      this.semanticObjcWatcher.enqueueReconcile('startup-stale-reconcile');
+    }
+    if (started) {
+      process.stderr.write(
+        `[CodeGraph MCP] Semantic ObjC IndexStore watch active for ${storePath} ` +
+        `(delta=${config.deltaMode}, scheduler=${config.scheduler.mode})\n`
+      );
+    } else {
+      process.stderr.write(`[CodeGraph MCP] Semantic ObjC IndexStore watch unavailable for ${storePath}\n`);
+    }
+  }
+
+  private persistSemanticObjcWatchState(cg: CodeGraph, status: SemanticObjcStatus, reason?: string): void {
+    if (status === 'queued') {
+      cg.markSemanticObjcQueued(reason ?? 'semantic-queued');
+    } else if (status === 'running') {
+      cg.markSemanticObjcRunning(reason);
+    } else if (status === 'stale' && reason) {
+      cg.markSemanticObjcStale(reason);
+    }
   }
 
   /**
@@ -285,6 +383,8 @@ export class MCPServer {
   stop(): void {
     // Close all cached cross-project connections first
     this.toolHandler.closeAll();
+    this.semanticObjcWatcher?.stop();
+    this.semanticObjcWatcher = null;
     // Close the main CodeGraph instance
     if (this.cg) {
       this.cg.close();

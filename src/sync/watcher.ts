@@ -162,6 +162,13 @@ export class FileWatcher {
   }
 
   /**
+   * Whether a file change has been observed but not fully synced yet.
+   */
+  hasPendingWork(): boolean {
+    return this.hasChanges || this.syncing || this.debounceTimer !== null;
+  }
+
+  /**
    * Schedule a debounced sync.
    */
   private scheduleSync(): void {

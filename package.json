@@ -22,7 +22,8 @@
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
-    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
+    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build:mac-objc-helper": "bash scripts/build-mac-objc-helper.sh"
   },
   "keywords": [
     "code-intelligence",
@@ -42,6 +43,9 @@
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
     "web-tree-sitter": "^0.25.3"
+  },
+  "optionalDependencies": {
+    "@colbymchenry/codegraph-mac-objc-enricher": "^0.9.4"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",

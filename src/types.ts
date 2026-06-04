@@ -78,6 +78,7 @@ export const LANGUAGES = [
   'php',
   'ruby',
   'swift',
+  'objc',
   'kotlin',
   'dart',
   'svelte',

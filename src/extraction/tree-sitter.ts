@@ -1425,6 +1425,36 @@ export class TreeSitterExtractor {
           calleeName = `${receiverName}.${methodName}`;
         }
       }
+    } else if (node.type === 'message_expression') {
+      // Objective-C: `[receiver part1:arg part2:arg]` is a message_expression with
+      // a `receiver` field and one-or-more `method` fields (one per selector
+      // segment). Join segments with `:` and append a trailing `:` for multi- or
+      // parameterised selectors. Skip self/super receivers in the qualified name.
+      const methodParts: string[] = [];
+      let sawParam = false;
+      for (let i = 0; i < node.childCount; i++) {
+        const fieldName = node.fieldNameForChild(i);
+        if (fieldName === 'method') {
+          const c = node.child(i);
+          if (c) methodParts.push(getNodeText(c, this.source));
+        } else if (fieldName === 'parameter') {
+          sawParam = true;
+        }
+      }
+      if (methodParts.length > 0) {
+        const selector = (methodParts.length === 1 && !sawParam)
+          ? methodParts[0]!
+          : methodParts.join(':') + ':';
+        const receiverNode = getChildByField(node, 'receiver');
+        const SKIP_OBJC_RECEIVERS = new Set(['self', 'super']);
+        let receiverName = '';
+        if (receiverNode && (receiverNode.type === 'identifier' || receiverNode.type === 'simple_identifier')) {
+          receiverName = getNodeText(receiverNode, this.source);
+        }
+        calleeName = receiverName && !SKIP_OBJC_RECEIVERS.has(receiverName)
+          ? `${receiverName}.${selector}`
+          : selector;
+      }
     } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 

@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -62,6 +62,67 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add nodes.usr for Objective-C / Swift semantic enrichment (IndexStoreDB on macOS)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN usr TEXT;
+        CREATE INDEX IF NOT EXISTS idx_nodes_usr ON nodes(usr);
+      `);
+    },
+  },
+  {
+    version: 6,
+    description: 'Add semantic ObjC unit delta state tables',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS semantic_objc_state (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_objc_units (
+          unit_id TEXT PRIMARY KEY,
+          fingerprint TEXT NOT NULL,
+          fingerprint_algo TEXT NOT NULL,
+          helper_version TEXT NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          status TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_objc_unit_files (
+          unit_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          role TEXT NOT NULL,
+          PRIMARY KEY (unit_id, file_path, role),
+          FOREIGN KEY (unit_id) REFERENCES semantic_objc_units(unit_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_objc_node_ownership (
+          node_id TEXT NOT NULL,
+          unit_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          usr TEXT,
+          ownership TEXT NOT NULL,
+          PRIMARY KEY (node_id, unit_id),
+          FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+          FOREIGN KEY (unit_id) REFERENCES semantic_objc_units(unit_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_objc_unit_files_file_path
+          ON semantic_objc_unit_files(file_path);
+        CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_unit_id
+          ON semantic_objc_node_ownership(unit_id);
+        CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_node_id
+          ON semantic_objc_node_ownership(node_id);
+        CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_file_path
+          ON semantic_objc_node_ownership(file_path);
       `);
     },
   },

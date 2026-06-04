@@ -25,6 +25,7 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
+import { FileLock } from '../utils';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
@@ -549,7 +550,15 @@ program
   .option('-f, --force', 'Force full re-index even if already indexed')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--with-semantic-objc', 'After indexing, also run Objective-C / Swift semantic enrichment via Xcode IndexStore (macOS only)')
+  .option('--semantic-objc-helper <path>', 'Path to the codegraph-xchelper Swift binary (overrides discovery)')
+  .option('--semantic-objc-store-path <path>', 'Explicit .indexstore/DataStore directory (overrides discovery)')
+  .action(async (pathArg: string | undefined, options: {
+    force?: boolean; quiet?: boolean; verbose?: boolean;
+    withSemanticObjc?: boolean;
+    semanticObjcHelper?: string;
+    semanticObjcStorePath?: string;
+  }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -567,6 +576,13 @@ program
         if (options.force) cg.clear();
         const result = await cg.indexAll();
         if (!result.success) process.exit(1);
+        if (options.withSemanticObjc) {
+          await runSemanticObjcEnrichment(projectPath, {
+            quiet: true,
+            helperPath: options.semanticObjcHelper,
+            storePath: options.semanticObjcStorePath,
+          });
+        }
         cg.destroy();
         return;
       }
@@ -601,6 +617,14 @@ program
         process.exit(1);
       }
 
+      if (options.withSemanticObjc) {
+        await runSemanticObjcEnrichment(projectPath, {
+          quiet: false,
+          helperPath: options.semanticObjcHelper,
+          storePath: options.semanticObjcStorePath,
+        });
+      }
+
       clack.outro('Done');
       cg.destroy();
     } catch (err) {
@@ -616,7 +640,15 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--with-semantic-objc', 'After syncing, also re-run Objective-C / Swift semantic enrichment (macOS only)')
+  .option('--semantic-objc-helper <path>', 'Path to the codegraph-xchelper Swift binary (overrides discovery)')
+  .option('--semantic-objc-store-path <path>', 'Explicit .indexstore/DataStore directory (overrides discovery)')
+  .action(async (pathArg: string | undefined, options: {
+    quiet?: boolean;
+    withSemanticObjc?: boolean;
+    semanticObjcHelper?: string;
+    semanticObjcStorePath?: string;
+  }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -632,6 +664,13 @@ program
 
       if (options.quiet) {
         await cg.sync();
+        if (options.withSemanticObjc) {
+          await runSemanticObjcEnrichment(projectPath, {
+            quiet: true,
+            helperPath: options.semanticObjcHelper,
+            storePath: options.semanticObjcStorePath,
+          });
+        }
         cg.destroy();
         return;
       }
@@ -659,6 +698,14 @@ program
         if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
         if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
         clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+      }
+
+      if (options.withSemanticObjc) {
+        await runSemanticObjcEnrichment(projectPath, {
+          quiet: false,
+          helperPath: options.semanticObjcHelper,
+          storePath: options.semanticObjcStorePath,
+        });
       }
 
       clack.outro('Done');
@@ -700,6 +747,7 @@ program
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
+      const semanticObjc = cg.getSemanticObjcState();
 
       // JSON output mode
       if (options.json) {
@@ -712,6 +760,7 @@ program
           dbSizeBytes: stats.dbSizeBytes,
           backend,
           journalMode,
+          semanticObjc,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: {
@@ -748,6 +797,13 @@ program
         ? chalk.green('wal')
         : chalk.yellow(`${journalMode || 'unknown'} ${getGlyphs().dash} WAL inactive; reads can block on writes`);
       console.log(`  Journal:   ${journalLabel}`);
+      console.log(`  Semantic ObjC: ${semanticObjc.status ?? 'not-run'}`);
+      if (semanticObjc.reason) {
+        console.log(`    Reason:       ${semanticObjc.reason}`);
+      }
+      if (semanticObjc.staleReason) {
+        console.log(`    Stale reason: ${semanticObjc.staleReason}`);
+      }
       console.log();
 
       // Node breakdown
@@ -1120,7 +1176,8 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--semantic-objc-config <json>', 'Semantic ObjC MCP watch config as JSON')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; semanticObjcConfig?: string }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
@@ -1133,7 +1190,10 @@ program
       if (options.mcp) {
         // Start MCP server - it handles initialization lazily based on rootUri from client
         const { MCPServer } = await import('../mcp/index');
-        const server = new MCPServer(projectPath);
+        const semanticObjc = options.semanticObjcConfig
+          ? JSON.parse(options.semanticObjcConfig)
+          : undefined;
+        const server = new MCPServer(projectPath, { semanticObjc });
         await server.start();
         // Server will run until terminated
       } else {
@@ -1394,6 +1454,215 @@ program
       });
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * Shared helper for `index` / `sync` / `enrich-objc` — runs the semantic ObjC
+ * enrichment pass and prints (or suppresses) the merge summary.
+ *
+ * Exits the process with a clear error on darwin-only violations or missing
+ * helper binary; lets the caller continue otherwise. The caller is responsible
+ * for closing the project's CodeGraph instance — this opens the underlying
+ * SqliteDatabase directly to avoid double-opening the file.
+ */
+async function runSemanticObjcEnrichment(
+  projectPath: string,
+  opts: { quiet: boolean; helperPath?: string; storePath?: string }
+): Promise<void> {
+  if (process.platform !== 'darwin') {
+    if (!opts.quiet) {
+      error('--with-semantic-objc requires macOS — semantic enrichment uses libIndexStore.dylib from Xcode.');
+    }
+    process.exit(1);
+  }
+
+  const { DatabaseConnection, getDatabasePath } = await import('../db');
+  const { QueryBuilder } = await import('../db/queries');
+  const {
+    enrichWithIndexStore,
+    inferSemanticObjcSourceRoot,
+    isRetryableSemanticObjcLockError,
+    locateHelperBinary,
+    markSemanticObjcFailed,
+    markSemanticObjcQueued,
+  } = await import('../extraction/semantic-objc');
+
+  const helperPath = opts.helperPath
+    ?? locateHelperBinary(path.resolve(__dirname, '../..'));
+  if (!helperPath) {
+    if (!opts.quiet) {
+      warn(
+        'codegraph-xchelper binary not found. Build it once with ' +
+        '"npm run build:mac-objc-helper" or install ' +
+        '@colbymchenry/codegraph-mac-objc-enricher. Skipping semantic enrichment.'
+      );
+    }
+    return;
+  }
+
+  const dbPath = getDatabasePath(projectPath);
+  const conn = DatabaseConnection.open(dbPath);
+  const queries = new QueryBuilder(conn.getDb());
+  const helperSourceRoot = inferSemanticObjcSourceRoot(projectPath, queries);
+  const lock = new FileLock(path.join(projectPath, '.codegraph', 'codegraph.lock'));
+  try {
+    await lock.withLockAsync(async () => {
+      if (!opts.quiet) {
+        info(`Enriching with IndexStore: ${helperPath}`);
+      }
+      try {
+        const summary = await enrichWithIndexStore(conn.getDb(), {
+          helperPath,
+          projectRoot: projectPath,
+          helperSourceRoot,
+          storePath: opts.storePath,
+          queries,
+        });
+        if (!opts.quiet) {
+          console.log(
+            `  Semantic ObjC: ${chalk.green(formatNumber(summary.symsMerged))} symbols, ` +
+            `${chalk.green(formatNumber(summary.relsMerged))} relation edges, ` +
+            `${chalk.green(formatNumber(summary.refsMerged))} call edges added`
+          );
+        }
+      } catch (err) {
+        if (isRetryableSemanticObjcLockError(err)) {
+          markSemanticObjcQueued(conn.getDb(), 'graph-lock-busy');
+        } else {
+          markSemanticObjcFailed(conn.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
+        }
+        throw err;
+      }
+    });
+  } finally {
+    conn.close();
+  }
+}
+
+/**
+ * codegraph enrich-objc [path]
+ *
+ * Macros-level enrichment for Objective-C / Swift codebases on macOS: spawns
+ * the `codegraph-xchelper` Swift helper, reads Xcode's IndexStore, and merges
+ * USRs + override / conformance edges into the tree-sitter graph.
+ *
+ * Requires:
+ *   - macOS with Xcode Command Line Tools (`libIndexStore.dylib`)
+ *   - A built `codegraph-xchelper` (see `src/extraction/semantic-objc/swift/`)
+ *   - A prior `xcodebuild` of the target project (the IndexStore is a build artifact)
+ */
+program
+  .command('enrich-objc [path]')
+  .description('Merge Xcode IndexStore data into the graph (macOS, requires prior build)')
+  .option('--helper <path>', 'Path to the codegraph-xchelper Swift binary (defaults to local dev build)')
+  .option('--store-path <path>', 'Explicit .indexstore/DataStore directory (defaults to DerivedData discovery)')
+  .option('--source-root <path>', 'Source root the helper relativizes paths against (defaults to project path)')
+  .option('--language <langs...>', 'Languages to include (default: objc)')
+  .option('--include-system', 'Include occurrences from SDK / system headers', false)
+  .option('-j, --json', 'Output the merge summary as JSON', false)
+  .action(async (pathArg: string | undefined, options: {
+    helper?: string;
+    storePath?: string;
+    sourceRoot?: string;
+    language?: string[];
+    includeSystem?: boolean;
+    json?: boolean;
+  }) => {
+    if (process.platform !== 'darwin') {
+      error('enrich-objc requires macOS — semantic enrichment uses libIndexStore.dylib from Xcode.');
+      process.exit(1);
+    }
+
+    const projectPath = resolveProjectPath(pathArg);
+    if (!isInitialized(projectPath)) {
+      error(`CodeGraph not initialized in ${projectPath}. Run "codegraph init" first.`);
+      process.exit(1);
+    }
+
+    try {
+      const { DatabaseConnection, getDatabasePath } = await import('../db');
+      const { QueryBuilder } = await import('../db/queries');
+      const {
+        enrichWithIndexStore,
+        inferSemanticObjcSourceRoot,
+        isRetryableSemanticObjcLockError,
+        locateHelperBinary,
+        markSemanticObjcFailed,
+        markSemanticObjcQueued,
+      } = await import('../extraction/semantic-objc');
+
+      const helperPath = options.helper
+        ?? locateHelperBinary(path.resolve(__dirname, '../..'));
+      if (!helperPath) {
+        error(
+          'codegraph-xchelper binary not found. Pass --helper <path>, or build it first:\n' +
+          '  cd src/extraction/semantic-objc/swift && swift build -c release'
+        );
+        process.exit(1);
+      }
+
+      const dbPath = getDatabasePath(projectPath);
+      const conn = DatabaseConnection.open(dbPath);
+      const queries = new QueryBuilder(conn.getDb());
+      const helperSourceRoot = options.sourceRoot ?? inferSemanticObjcSourceRoot(projectPath, queries);
+      const lock = new FileLock(path.join(projectPath, '.codegraph', 'codegraph.lock'));
+      try {
+        const summary = await lock.withLockAsync(async () => {
+          if (!options.json) {
+            info(`Enriching with IndexStore: ${helperPath}`);
+            info('This can take several minutes on large projects — the helper streams every symbol.');
+          }
+          try {
+            return await enrichWithIndexStore(conn.getDb(), {
+              helperPath,
+              projectRoot: projectPath,
+              helperSourceRoot,
+              storePath: options.storePath,
+              queries,
+              languages: options.language,
+              includeSystem: options.includeSystem,
+            });
+          } catch (err) {
+            if (isRetryableSemanticObjcLockError(err)) {
+              markSemanticObjcQueued(conn.getDb(), 'graph-lock-busy');
+            } else {
+              markSemanticObjcFailed(conn.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
+            }
+            throw err;
+          }
+        });
+
+        if (options.json) {
+          console.log(JSON.stringify(summary, null, 2));
+        } else {
+          console.log();
+          console.log(chalk.bold('Semantic ObjC enrichment complete'));
+          console.log(chalk.dim('Symbols'));
+          console.log(`  Seen:                ${formatNumber(summary.symsSeen)}`);
+          console.log(`  Enriched:            ${chalk.green(formatNumber(summary.symsMerged))} (usr populated)`);
+          console.log(`  Outside project:     ${formatNumber(summary.symsOutsideProject)} (DerivedData / frameworks)`);
+          console.log(`  No matching node:    ${formatNumber(summary.symsNotMatched)}`);
+          console.log(chalk.dim('Relations (override / base / extended)'));
+          console.log(`  Seen:                ${formatNumber(summary.relsSeen)}`);
+          console.log(`  Edges added:         ${chalk.green(formatNumber(summary.relsMerged))}`);
+          console.log(`  Endpoint missing:    ${formatNumber(summary.relsSkipped)}`);
+          console.log(`  Already present:     ${formatNumber(summary.relsAlreadyPresent)}`);
+          console.log(chalk.dim('Call references (semantic call edges)'));
+          console.log(`  Seen:                ${formatNumber(summary.refsSeen)}`);
+          console.log(`  Call edges added:    ${chalk.green(formatNumber(summary.refsMerged))}`);
+          console.log(`  Non-call (read/write skipped): ${formatNumber(summary.refsNonCall)}`);
+          console.log(`  Outside project:     ${formatNumber(summary.refsOutsideProject)}`);
+          console.log(`  No source node:      ${formatNumber(summary.refsNoSource)}`);
+          console.log(`  No target node:      ${formatNumber(summary.refsNoTarget)}`);
+          console.log(`  Already present:     ${formatNumber(summary.refsAlreadyPresent)}`);
+        }
+      } finally {
+        conn.close();
+      }
+    } catch (err) {
+      error(`enrich-objc failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

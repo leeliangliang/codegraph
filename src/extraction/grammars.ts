@@ -31,6 +31,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   php: 'tree-sitter-php.wasm',
   ruby: 'tree-sitter-ruby.wasm',
   swift: 'tree-sitter-swift.wasm',
+  objc: 'tree-sitter-objc.wasm',
   kotlin: 'tree-sitter-kotlin.wasm',
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
@@ -76,6 +77,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
+  '.m': 'objc',
+  '.mm': 'objc',
   '.kt': 'kotlin',
   '.kts': 'kotlin',
   '.dart': 'dart',
@@ -211,8 +214,11 @@ export function detectLanguage(filePath: string, source?: string): Language {
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
-  // .h files could be C or C++ — check source content for C++ features
+  // .h files could be C, C++, or Objective-C. Check ObjC first (its tokens are
+  // unambiguous: @interface/@protocol/@property never appear in C or C++), then
+  // C++. If neither matches, leave it as C.
   if (lang === 'c' && ext === '.h' && source) {
+    if (looksLikeObjC(source)) return 'objc';
     if (looksLikeCpp(source)) return 'cpp';
   }
 
@@ -226,6 +232,16 @@ export function detectLanguage(filePath: string, source?: string): Language {
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
   return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+}
+
+/**
+ * Heuristic: does a .h file contain Objective-C constructs?
+ * `@interface`/`@protocol`/`@property` and framework-style `#import <X/Y.h>`
+ * are unambiguous ObjC markers — never valid C or C++.
+ */
+function looksLikeObjC(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  return /@(interface|implementation|protocol|property|end|optional|required|import)\b|#import\s*<[^>]+\/[^>]+>/.test(sample);
 }
 
 /**
@@ -316,6 +332,7 @@ export function getLanguageDisplayName(language: Language): string {
     php: 'PHP',
     ruby: 'Ruby',
     swift: 'Swift',
+    objc: 'Objective-C',
     kotlin: 'Kotlin',
     dart: 'Dart',
     svelte: 'Svelte',

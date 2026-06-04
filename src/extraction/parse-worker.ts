@@ -55,10 +55,29 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[] }) => {
+type ParseWorkerMessage = {
+  type: string;
+  id?: number;
+  filePath?: string;
+  content?: string;
+  languages?: Language[];
+  frameworkNames?: string[];
+};
+
+const sendMessage = (message: unknown): void => {
+  if (parentPort) {
+    parentPort.postMessage(message);
+    return;
+  }
+  if (process.send) {
+    process.send(message);
+  }
+};
+
+async function handleMessage(msg: ParseWorkerMessage): Promise<void> {
   if (msg.type === 'load-grammars') {
     await loadGrammarsForLanguages(msg.languages!);
-    parentPort!.postMessage({ type: 'grammars-loaded' });
+    sendMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
     try {
@@ -72,7 +91,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
         resetParser(language);
       }
 
-      parentPort!.postMessage({ type: 'parse-result', id, result });
+      sendMessage({ type: 'parse-result', id, result });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
 
@@ -83,7 +102,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
         process.exit(1);
       }
 
-      parentPort!.postMessage({
+      sendMessage({
         type: 'parse-result',
         id,
         result: {
@@ -96,6 +115,14 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       });
     }
   } else if (msg.type === 'shutdown') {
-    parentPort!.postMessage({ type: 'shutdown-ack' });
+    sendMessage({ type: 'shutdown-ack' });
   }
+}
+
+parentPort?.on('message', (msg: ParseWorkerMessage) => {
+  void handleMessage(msg);
+});
+
+process.on('message', (msg: ParseWorkerMessage) => {
+  void handleMessage(msg);
 });

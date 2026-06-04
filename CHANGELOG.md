@@ -7,6 +7,133 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Objective-C / Swift semantic enrichment now has the persistence and MCP-side
+  plumbing needed for safe unit-level IndexStore deltas: semantic freshness
+  state, unit/source membership tables, helper capability records, confidence-
+  gated delta planning, provenance-scoped rewrite helpers, IndexStore quiescence
+  checks, idle-only scheduling, and `codegraph_status` visibility for semantic
+  fresh/stale status. CodeGraph still does not build Xcode projects by default;
+  Xcode must produce the IndexStore, then CodeGraph watches and safely merges
+  after the store is stable.
+
+## [0.9.4] - 2026-05-22
+
+### Added
+- **`codegraph enrich-objc` — Semantic enrichment for Objective-C / Swift on
+  macOS via Xcode's IndexStore.** Layered on top of the tree-sitter pass added
+  in [0.9.3]; the syntactic graph becomes the foundation, and this command
+  overlays semantic information that tree-sitter genuinely cannot produce.
+  - Spawns a small Swift helper (`codegraph-xchelper`) that links Apple's
+    [`swiftlang/indexstore-db`](https://github.com/swiftlang/indexstore-db)
+    and streams the contents of the project's `.indexstore` as NDJSON.
+  - **Phase A — USR population**: each existing tree-sitter node gets its
+    Clang/Swift USR attached on the new `nodes.usr` column when the helper
+    emits a symbol at the same `(file_path, start_line)`.
+  - **Phase B — semantic relation edges**: override / base / extended /
+    accessor relations from IndexStoreDB are inserted as new edges with
+    `provenance = 'semantic-objc'`. Re-running enrichment is idempotent — the
+    merger checks for an existing edge with the same shape before inserting.
+  - **Phase C — semantic call edges**: every `call` reference is resolved by
+    finding the innermost tree-sitter node that brackets the call site (via
+    `start_line ≤ line ≤ end_line`) and looking up the callee by USR. The
+    resulting `calls` edge sits alongside any syntactic edge tree-sitter
+    already emitted, distinguished by `provenance = 'semantic-objc'` and
+    carrying `{dynamic, role}` in `metadata`. The `dynamic` flag captures
+    Objective-C `id`-typed dispatch sites — same selector, target not
+    statically resolvable — so callers/callees queries can decide whether to
+    trust the semantic target. Non-call refs (read / write) are streamed but
+    not turned into edges; the tree-sitter pass doesn't model those either,
+    so promoting them would change graph shape rather than enrich it.
+  - Symbols outside the project tree (DerivedData, vendored frameworks, SDK
+    headers) are counted and skipped — they don't have a tree-sitter node to
+    attach to.
+  - Schema migration v5 adds `nodes.usr TEXT` + `idx_nodes_usr`. Existing
+    databases auto-migrate the next time they're opened; no manual step.
+
+  **How to use:**
+  ```bash
+  # 1. Build the helper once (Swift 5.9+, Xcode 14+):
+  cd src/extraction/semantic-objc/swift && swift build -c release
+
+  # 2. Make sure Xcode wrote an .indexstore for your project:
+  xcodebuild build COMPILER_INDEX_STORE_ENABLE=YES INDEX_ENABLE_DATA_STORE=YES \
+      -scheme YourScheme
+  # (Xcode GUI builds already do this by default.)
+
+  # 3. Run enrichment against an initialized CodeGraph project:
+  codegraph enrich-objc /path/to/proj
+  ```
+
+  **Chained workflow** — `index` and `sync` accept a new `--with-semantic-objc`
+  flag that runs the enrichment pass automatically right after the tree-sitter
+  pass / file diff. Useful when re-indexing after an Xcode build:
+  ```bash
+  codegraph index --with-semantic-objc /path/to/proj
+  codegraph sync  --with-semantic-objc /path/to/proj    # after rebuild
+  ```
+  Both subcommands also expose `--semantic-objc-helper <path>` and
+  `--semantic-objc-store-path <path>` for cases where the helper or store
+  can't be discovered automatically.
+
+  Tested on a 14,584-unit production iOS workspace: the helper emits ~141k
+  symbols, ~253k references, and ~184k relations in ~12 minutes — covering
+  cross-file method overrides, protocol conformances, and dynamic-dispatch
+  call sites that the tree-sitter pass marks only as "selector X".
+
+  **Known limits (deliberate scope for the initial pass):**
+  - macOS-only — `libIndexStore.dylib` ships with Xcode.
+  - Requires a prior Xcode build (the `.indexstore` is a build artifact).
+  - The Swift helper binary is shipped via the optional
+    `@colbymchenry/codegraph-mac-objc-enricher` npm subpackage — npm installs it
+    automatically on darwin/arm64 and darwin/x64, and skips it on every other
+    platform via the subpackage's `os` constraint. A new GitHub Actions
+    workflow (`.github/workflows/build-mac-objc-helper.yml`) cuts a universal
+    `arm64 + x86_64` binary via `swift build --arch` + `lipo -create` and
+    publishes the subpackage. For local development, build the helper with
+    `npm run build:mac-objc-helper` and `enrich-objc` will pick it up from the
+    swift project's `.build/release/` automatically.
+
+### Changed
+- `nodes` table gained a nullable `usr` column. Reads from this column are
+  null for languages other than ObjC / Swift, and for projects where
+  `enrich-objc` has never been run. No existing query semantics change.
+
+[0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
+
+## [0.9.3] - 2026-05-22
+
+### Added
+- **Objective-C support (`.m`, `.mm`).** CodeGraph now indexes Objective-C
+  sources via tree-sitter-objc (shipped by `tree-sitter-wasms`, no extra
+  install). Extracted symbols and edges:
+  - `@interface` and `@implementation` declarations → `class` nodes
+  - `@protocol` declarations → `protocol` nodes
+  - `@property` declarations → `property` nodes
+  - Instance (`-`) and class (`+`) methods → `method` nodes, with the canonical
+    selector as the name (e.g. `setObject:forKey:`, not just `setObject`)
+  - `[receiver msg:arg part:arg]` message sends → `calls` references, with
+    the receiver as a qualifier when it isn't `self` / `super`
+  - `#import <Framework/Header.h>`, `#import "Local.h"`, and `@import Module;`
+    → `imports` references
+  - Categories (`@interface Foo (Bar)` / `@implementation Foo (Bar)`) are kept
+    distinct from their base class by encoding the qualified name as `Foo(Bar)`,
+    so two categories on the same base class never collide.
+  - `.h` files are routed to Objective-C when they contain `@interface`,
+    `@protocol`, `@property`, etc.; the existing C / C++ heuristic still wins
+    for non-ObjC headers.
+
+  **Known limits** (deliberate scope for the first iteration):
+  - `.mm` ObjC++ files parse via the ObjC-only grammar; the ObjC structure is
+    extracted normally but C++ symbols inside `.mm` files are silently dropped.
+  - Message-send call resolution is syntactic (selector + receiver text). True
+    semantic dispatch resolution would require IndexStoreDB / libclang and is
+    out of scope here.
+  - Class-side `<Proto, Proto>` conformance lists (which the grammar parses as
+    `parameterized_arguments`) are not yet promoted to `implements` edges.
+
 ## [0.9.2] - 2026-05-21
 
 ### Added
@@ -93,6 +220,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
 

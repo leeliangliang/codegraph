@@ -41,6 +41,17 @@ npx @colbymchenry/codegraph        # zero-install, or:
 npm i -g @colbymchenry/codegraph
 ```
 
+Developing CodeGraph locally? Build and link this checkout so the global `codegraph` command points at your local `dist/bin/codegraph.js`:
+
+```bash
+npm run build
+npm link
+which codegraph
+codegraph --version
+```
+
+Re-run `npm run build` after source changes. Re-run `npm link` only if the global link is lost, your npm prefix changes, or package metadata/bin mappings change.
+
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent.</sub>
 
 ### Initialize Projects
@@ -239,6 +250,15 @@ npm install -g @colbymchenry/codegraph
 }
 ```
 
+**Optional: add Apple's official Xcode MCPBridge separately.** CodeGraph does not proxy Xcode tools. For live Xcode diagnostics/issues, keep Xcode open, enable `Xcode → Settings → Intelligence → Model Context Protocol → Allow external agents to use "Xcode Tools"`, then add the official sibling MCP server in Claude Code:
+
+```bash
+xcrun -f mcpbridge
+claude mcp add --transport stdio xcode -- xcrun mcpbridge
+```
+
+After restarting Claude Code, use the `mcp__xcode__*` tools (for example `mcp__xcode__XcodeListNavigatorIssues` or `mcp__xcode__XcodeRefreshCodeIssuesInFile`) alongside CodeGraph's `mcp__codegraph__*` tools.
+
 </details>
 
 <details>
@@ -435,6 +455,331 @@ What that means in practice:
 > Committed files that aren't gitignored *are* indexed, even under `vendor/` or a
 > committed `dist/`. If you commit a dependency or build directory you don't want
 > in the graph, add it to `.gitignore`.
+
+## Deployment Guide
+
+### Deployment Models
+
+CodeGraph can be deployed in three common ways:
+
+| Model | Best for | Command |
+|---|---|---|
+| Self-contained installer | End users who do not want to manage Node.js | `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh \| sh` |
+| npm global install | Users who already use npm / npx | `npm i -g @colbymchenry/codegraph` |
+| Local source checkout | Development and testing unpublished changes | `npm run build && npm link` |
+
+The installer and npm package expose the same `codegraph` CLI. Per-project data always lives in the target repository's `.codegraph/` directory.
+
+### Deploy from the Published Package
+
+```bash
+# macOS / Linux self-contained install
+curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+
+# Windows PowerShell self-contained install
+irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
+
+# npm alternative
+npm i -g @colbymchenry/codegraph
+```
+
+Verify the deployed binary:
+
+```bash
+which codegraph        # macOS / Linux
+codegraph --version
+codegraph status .     # in an initialized project
+```
+
+### Deploy from a Local Checkout
+
+Use this when validating source changes before release or when configuring agents to use your local build:
+
+```bash
+cd /path/to/Codegraph
+npm install
+npm run build
+npm link
+which codegraph
+codegraph --version
+```
+
+After editing source, run `npm run build` again. The linked CLI executes `dist/bin/codegraph.js`, not `src/bin/codegraph.ts`. Re-run `npm link` only if the global link is lost, your npm prefix changes, or package metadata / bin mappings change.
+
+### Configure Agents
+
+Interactive setup:
+
+```bash
+codegraph install
+```
+
+Non-interactive examples:
+
+```bash
+codegraph install --yes
+codegraph install --target=claude,cursor --location=global --yes
+codegraph install --target=auto --location=local --yes
+codegraph install --print-config claude
+```
+
+For manual MCP configuration, point the agent at:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp"]
+    }
+  }
+}
+```
+
+If the agent launches MCP servers from the wrong working directory, pass an explicit project path:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "/absolute/path/to/project"]
+    }
+  }
+}
+```
+
+### Initialize a Project
+
+```bash
+cd /path/to/project
+codegraph init -i
+codegraph status
+```
+
+`init -i` creates `.codegraph/`, builds the initial SQLite graph, and makes the MCP tools available to configured agents. After initialization, the MCP server's watcher keeps the graph updated on source-file changes.
+
+### Deploy Semantic ObjC / Swift Enrichment
+
+The normal tree-sitter pass indexes Objective-C and Swift cross-platform. The optional semantic layer requires macOS, Xcode, and an IndexStore produced by a prior Xcode build.
+
+From the CodeGraph checkout, build or install the helper when testing local changes:
+
+```bash
+npm run build
+npm run build:mac-objc-helper
+npm link
+codegraph enrich-objc --help
+```
+
+In the target Xcode project:
+
+```bash
+# 1. Build with Xcode so IndexStore data exists
+xcodebuild -workspace YourApp.xcworkspace -scheme YourScheme build
+
+# 2. Initialize and index CodeGraph
+codegraph init -i /path/to/project
+
+# 3. Run semantic enrichment
+codegraph enrich-objc /path/to/project --language objc swift
+```
+
+If discovery fails, pass paths explicitly:
+
+```bash
+codegraph enrich-objc /path/to/project \
+  --store-path ~/Library/Developer/Xcode/DerivedData/YourApp-xxxx/Index.noindex/DataStore \
+  --helper /path/to/codegraph-xchelper \
+  --language objc swift
+```
+
+For MCP auto-refresh of Xcode IndexStore changes:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": [
+        "serve",
+        "--mcp",
+        "--semantic-objc-config",
+        "{\"enabled\":true,\"watchIndexStore\":true}"
+      ]
+    }
+  }
+}
+```
+
+The semantic watcher waits for IndexStore quiescence, serializes writes through the same graph lock as normal indexing, and reports `fresh`, `stale`, `queued`, `running`, `failed`, or `reconciling` through status.
+
+### Release Deployment
+
+Project releases are published by the GitHub Actions **Release** workflow, not by running `npm publish` manually. The workflow builds platform bundles, creates the GitHub Release, and publishes the npm shim/package set.
+
+Release preparation checklist:
+
+```bash
+npm run build
+npm test
+# update CHANGELOG.md and package.json/package-lock.json
+
+git add package.json package-lock.json CHANGELOG.md
+git commit -m "release: X.Y.Z (<one-line summary>)"
+git push
+```
+
+Then run **Actions → Release → Run workflow** on `main`. Do not manually create tags or run `npm publish` for normal releases.
+
+---
+
+## Operations Runbook
+
+### Daily Use
+
+| Task | Command |
+|---|---|
+| Check graph health | `codegraph status` |
+| Rebuild from scratch | `codegraph index --force` |
+| Incrementally sync changed files | `codegraph sync` |
+| Run MCP server manually | `codegraph serve --mcp` |
+| Remove project data | `codegraph uninit` |
+| Clear a stale graph lock | `codegraph unlock` |
+
+### Check Status
+
+```bash
+codegraph status
+codegraph status --json
+```
+
+Review these fields first:
+
+- `Journal: wal` — expected on local filesystems; concurrent reads are safe.
+- `Pending Changes` — run `codegraph sync` if files are waiting to be indexed.
+- `Semantic ObjC` — semantic enrichment state when the optional macOS layer is enabled.
+- `Semantic ObjC reason` / `stale reason` — why semantic data is queued, stale, or failed.
+
+### Keep the Graph Fresh
+
+The MCP server auto-syncs source edits while it is running. It does not force a full rebuild every time a new agent window opens.
+
+Use manual sync when:
+
+```bash
+codegraph sync /path/to/project
+```
+
+- files changed while no MCP server was running;
+- the watcher is unavailable on the filesystem;
+- you want to refresh before a long coding session;
+- `codegraph status` reports pending changes.
+
+Use a full rebuild when language extraction behavior changed or the graph looks inconsistent:
+
+```bash
+codegraph index --force /path/to/project
+```
+
+### Operate Semantic ObjC / Swift Enrichment
+
+Typical flow after source edits and an Xcode build:
+
+```bash
+xcodebuild -workspace YourApp.xcworkspace -scheme YourScheme build
+codegraph sync --with-semantic-objc /path/to/project
+```
+
+Or run only the semantic layer:
+
+```bash
+codegraph enrich-objc /path/to/project --language objc swift
+```
+
+State meanings:
+
+| State | Meaning | Operator action |
+|---|---|---|
+| `fresh` | Semantic data is current | None |
+| `queued` | Work is waiting for the graph lock or idle window | Usually wait; check for another `codegraph` process if it persists |
+| `running` | Semantic enrichment is active | Wait; large IndexStores can take minutes |
+| `stale` | Existing semantic data was preserved but needs reconcile | Run `codegraph enrich-objc` or wait for MCP startup/watch reconcile |
+| `failed` | Helper, IndexStore, or merge failed | Check `Semantic ObjC reason`, helper path, Xcode build, and store path |
+| `reconciling` | Full reconcile is in progress/planned | Wait or inspect logs/status |
+
+If multiple agent windows are open, only one process writes `.codegraph/codegraph.db` at a time. Others report `queued: graph-lock-busy` and retry. If the writing process exits, later retries remove dead-process locks and rerun the work safely.
+
+### Lock Handling
+
+CodeGraph uses `.codegraph/codegraph.lock` to serialize writers across CLI, git hooks, and MCP servers.
+
+```bash
+codegraph status
+codegraph unlock /path/to/project
+```
+
+Use `codegraph unlock` only when you are confident no `codegraph index`, `codegraph sync`, `codegraph enrich-objc`, or `codegraph serve --mcp` process is actively writing. Live owner PIDs are treated as active locks; dead-process locks can be removed and retried safely.
+
+### MCP Server Operations
+
+Run manually for smoke testing:
+
+```bash
+codegraph serve --mcp --path /path/to/project
+```
+
+With semantic ObjC watch enabled:
+
+```bash
+codegraph serve --mcp --path /path/to/project \
+  --semantic-objc-config '{"enabled":true,"watchIndexStore":true}'
+```
+
+Useful checks:
+
+```bash
+codegraph status /path/to/project
+codegraph files /path/to/project --max-depth 2
+codegraph query "SomeSymbol" /path/to/project
+```
+
+If an MCP client reports that no CodeGraph project is loaded, add `--path /absolute/path/to/project` to the MCP server args or initialize the project with `codegraph init -i`.
+
+### Upgrade / Rollback
+
+Upgrade published installs:
+
+```bash
+# installer-managed
+curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+
+# npm-managed
+npm i -g @colbymchenry/codegraph@latest
+```
+
+Rollback npm-managed installs:
+
+```bash
+npm i -g @colbymchenry/codegraph@<version>
+```
+
+After upgrade or rollback, restart your agent so it relaunches the MCP server. Existing `.codegraph/` data stays local to each project; run `codegraph index --force` if a release note says a reindex is required.
+
+### Incident Checklist
+
+1. Run `codegraph status --json` and capture the output.
+2. Check for active writers: `ps aux | grep '[c]odegraph'`.
+3. If status shows pending changes, run `codegraph sync`.
+4. If semantic ObjC is stale, run `codegraph enrich-objc` with explicit `--store-path` and `--helper` if discovery is suspect.
+5. If the graph remains inconsistent, run `codegraph index --force`.
+6. Restart the agent so MCP picks up the rebuilt graph.
+7. If reporting a bug, include OS, CodeGraph version, install method, `codegraph status --json`, and the command that failed.
+
+---
 
 ## Supported Languages
 

@@ -1,0 +1,3 @@
+# The prebuilt binary is produced by CI (build-mac-objc-helper workflow) or by
+# `npm run build:mac-objc-helper` locally. It's never committed — only published.
+bin/codegraph-xchelper

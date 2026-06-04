@@ -47,6 +47,22 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions } from './sync';
+import {
+  getSemanticObjcState,
+  isRetryableSemanticObjcLockError,
+  markSemanticObjcFailed,
+  markSemanticObjcQueued,
+  markSemanticObjcRunning,
+  markSemanticObjcStale,
+  type SemanticObjcStateSnapshot,
+} from './extraction/semantic-objc/state';
+import {
+  enrichWithIndexStore,
+  inferSemanticObjcSourceRoot,
+  locateHelperBinary,
+  type EnrichOptions,
+  type MergeSummary,
+} from './extraction/semantic-objc';
 
 // Re-export types for consumers
 export * from './types';
@@ -442,6 +458,10 @@ export class CodeGraph {
     return this.indexMutex.isLocked();
   }
 
+  hasPendingWatchSync(): boolean {
+    return this.watcher?.hasPendingWork() ?? false;
+  }
+
   // ===========================================================================
   // File Watching
   // ===========================================================================
@@ -573,6 +593,70 @@ export class CodeGraph {
    */
   getJournalMode(): string {
     return this.db.getJournalMode();
+  }
+
+  getSemanticObjcState(): SemanticObjcStateSnapshot {
+    return getSemanticObjcState(this.db.getDb());
+  }
+
+  getGraphLockPath(): string {
+    return path.join(this.projectRoot, '.codegraph', 'codegraph.lock');
+  }
+
+  markSemanticObjcStale(reason: string): void {
+    markSemanticObjcStale(this.db.getDb(), reason);
+  }
+
+  markSemanticObjcQueued(reason: string): void {
+    markSemanticObjcQueued(this.db.getDb(), reason);
+  }
+
+  markSemanticObjcRunning(reason?: string): void {
+    markSemanticObjcRunning(this.db.getDb(), reason);
+  }
+
+  async enrichSemanticObjc(options: Partial<Omit<EnrichOptions, 'projectRoot'>> = {}): Promise<MergeSummary> {
+    try {
+      return await this.fileLock.withLockAsync(() => this.enrichSemanticObjcWithGraphLockHeld(options));
+    } catch (err) {
+      if (isRetryableSemanticObjcLockError(err)) {
+        markSemanticObjcQueued(this.db.getDb(), 'graph-lock-busy');
+      } else {
+        markSemanticObjcFailed(this.db.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * @internal Only call after this process has acquired the project's graph lock.
+   * Public callers must use enrichSemanticObjc() so cross-process single-writer
+   * protection is preserved.
+   */
+  async enrichSemanticObjcWithGraphLockHeld(options: Partial<Omit<EnrichOptions, 'projectRoot'>> = {}): Promise<MergeSummary> {
+    const helperPath = options.helperPath ?? locateHelperBinary(path.resolve(__dirname, '..'));
+    if (!helperPath) {
+      throw new Error(
+        'codegraph-xchelper binary not found. Build it with "npm run build:mac-objc-helper" or configure helperPath.'
+      );
+    }
+    markSemanticObjcRunning(this.db.getDb());
+    try {
+      return await enrichWithIndexStore(this.db.getDb(), {
+        ...options,
+        helperPath,
+        projectRoot: this.projectRoot,
+        helperSourceRoot: options.helperSourceRoot ?? inferSemanticObjcSourceRoot(this.projectRoot, this.queries),
+        queries: this.queries,
+      });
+    } catch (err) {
+      if (isRetryableSemanticObjcLockError(err)) {
+        markSemanticObjcQueued(this.db.getDb(), 'graph-lock-busy');
+      } else {
+        markSemanticObjcFailed(this.db.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
+      }
+      throw err;
+    }
   }
 
   // ===========================================================================

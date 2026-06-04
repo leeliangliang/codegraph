@@ -16,6 +16,7 @@ import {
   writeSync,
 } from 'fs';
 import { clamp, validatePathWithinRoot } from '../utils';
+import type { SemanticObjcStateSnapshot } from '../extraction/semantic-objc';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -1376,6 +1377,15 @@ export class ToolHandler {
         `**Journal mode:** ⚠ ${journalMode || 'unknown'} — WAL not active, so reads ` +
         `can block on a concurrent write (WAL appears unsupported on this filesystem)`
       );
+    }
+
+    const semanticObjc = cg.getSemanticObjcState() as SemanticObjcStateSnapshot;
+    lines.push(`**Semantic ObjC:** ${semanticObjc.status ?? 'not-run'}`);
+    if (semanticObjc.reason) {
+      lines.push(`**Semantic ObjC reason:** ${semanticObjc.reason}`);
+    }
+    if (semanticObjc.staleReason) {
+      lines.push(`**Semantic ObjC stale reason:** ${semanticObjc.staleReason}`);
     }
 
     lines.push('', '### Nodes by Kind:');

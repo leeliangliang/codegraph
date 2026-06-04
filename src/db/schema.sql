@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_abstract INTEGER DEFAULT 0,
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
+    usr TEXT, -- Optional Clang/Swift USR; populated by IndexStoreDB enrichment on macOS
     updated_at INTEGER NOT NULL
 );
 
@@ -92,6 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_language ON nodes(language);
 CREATE INDEX IF NOT EXISTS idx_nodes_file_line ON nodes(file_path, start_line);
 CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
+CREATE INDEX IF NOT EXISTS idx_nodes_usr ON nodes(usr);
 
 -- Full-text search index on node names, docstrings, and signatures
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -149,3 +151,47 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Objective-C / Swift semantic enrichment state for IndexStore unit-level deltas
+CREATE TABLE IF NOT EXISTS semantic_objc_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS semantic_objc_units (
+    unit_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    fingerprint_algo TEXT NOT NULL,
+    helper_version TEXT NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    status TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS semantic_objc_unit_files (
+    unit_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    role TEXT NOT NULL,
+    PRIMARY KEY (unit_id, file_path, role),
+    FOREIGN KEY (unit_id) REFERENCES semantic_objc_units(unit_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS semantic_objc_node_ownership (
+    node_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    usr TEXT,
+    ownership TEXT NOT NULL,
+    PRIMARY KEY (node_id, unit_id),
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (unit_id) REFERENCES semantic_objc_units(unit_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_objc_unit_files_file_path
+    ON semantic_objc_unit_files(file_path);
+CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_unit_id
+    ON semantic_objc_node_ownership(unit_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_node_id
+    ON semantic_objc_node_ownership(node_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_file_path
+    ON semantic_objc_node_ownership(file_path);

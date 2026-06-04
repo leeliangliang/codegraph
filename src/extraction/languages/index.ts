@@ -19,6 +19,7 @@ import { csharpExtractor } from './csharp';
 import { phpExtractor } from './php';
 import { rubyExtractor } from './ruby';
 import { swiftExtractor } from './swift';
+import { objcExtractor } from './objc';
 import { kotlinExtractor } from './kotlin';
 import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
@@ -41,6 +42,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   php: phpExtractor,
   ruby: rubyExtractor,
   swift: swiftExtractor,
+  objc: objcExtractor,
   kotlin: kotlinExtractor,
   dart: dartExtractor,
   pascal: pascalExtractor,

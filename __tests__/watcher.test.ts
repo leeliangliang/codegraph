@@ -89,6 +89,10 @@ describe('FileWatcher', () => {
 
       watcher.start();
 
+      // Let fs.watch finish subscribing before the first write; otherwise the
+      // initial event can be missed under heavy parallel test load.
+      await new Promise((r) => setTimeout(r, 100));
+
       // Create a new file
       fs.writeFileSync(path.join(testDir, 'src', 'new.ts'), 'export const y = 2;');
 
@@ -179,6 +183,9 @@ describe('FileWatcher', () => {
 
       watcher.start();
 
+      // Let fs.watch finish subscribing before the first write under heavy parallel test load.
+      await new Promise((r) => setTimeout(r, 100));
+
       fs.writeFileSync(path.join(testDir, 'src', 'test.ts'), 'export const z = 3;');
 
       await waitFor(() => onSyncComplete.mock.calls.length > 0, 5000);
@@ -196,6 +203,9 @@ describe('FileWatcher', () => {
       });
 
       watcher.start();
+
+      // Let fs.watch finish subscribing before the first write under heavy parallel test load.
+      await new Promise((r) => setTimeout(r, 100));
 
       fs.writeFileSync(path.join(testDir, 'src', 'test.ts'), 'export const z = 3;');
 
@@ -255,6 +265,9 @@ describe('FileWatcher', () => {
       const initialNodes = initialStats.nodeCount;
 
       cg.watch({ debounceMs: 300 });
+
+      // Let fs.watch finish subscribing before the first write under heavy parallel test load.
+      await new Promise((r) => setTimeout(r, 100));
 
       // Add a new file with a function
       fs.writeFileSync(

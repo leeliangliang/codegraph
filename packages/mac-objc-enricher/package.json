@@ -1,0 +1,26 @@
+{
+  "name": "@colbymchenry/codegraph-mac-objc-enricher",
+  "version": "0.9.4",
+  "description": "Prebuilt macOS Swift helper that streams Xcode IndexStore data to the @colbymchenry/codegraph semantic enrichment pass. Optional, installed only on darwin.",
+  "license": "MIT",
+  "homepage": "https://github.com/colbymchenry/codegraph",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colbymchenry/codegraph.git",
+    "directory": "packages/mac-objc-enricher"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

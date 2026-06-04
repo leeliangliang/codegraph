@@ -78,6 +78,16 @@ describe('FileLock', () => {
     lock.release();
   });
 
+  it('should not age out a lock held by a live process', () => {
+    fs.writeFileSync(lockPath, String(process.pid));
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).toThrow(/locked by another process/);
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+  });
+
   it('should execute function with withLock', () => {
     const lock = new FileLock(lockPath);
 
