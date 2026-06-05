@@ -241,6 +241,10 @@ export class Daemon {
         this.armIdleTimer();
         return;
       }
+      if (!this.engine.isIdle()) {
+        this.armIdleTimer();
+        return;
+      }
       void this.stop('idle timeout');
     }, this.idleTimeoutMs);
     // Don't keep the event loop alive just for this — the net.Server keeps the

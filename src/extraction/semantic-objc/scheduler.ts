@@ -45,6 +45,7 @@ export class SemanticObjcIdleScheduler {
     if (this.queued && this.queueDepth() >= this.opts.maxQueueDepth) {
       this.pendingJob = job;
       this.opts.onState?.('queued', 'semantic-queue-full');
+      this.scheduleRetry();
       return { ran: false, reason: 'semantic-queue-full' };
     }
 

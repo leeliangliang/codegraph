@@ -15,6 +15,7 @@ export interface SemanticObjcIndexStoreWatcherOptions {
 export class SemanticObjcIndexStoreWatcher {
   private watcher: fs.FSWatcher | null = null;
   private pendingTimer: NodeJS.Timeout | null = null;
+  private quiescenceRetryTimer: NodeJS.Timeout | null = null;
   private readonly scheduler: SemanticObjcIdleScheduler;
 
   constructor(private readonly opts: SemanticObjcIndexStoreWatcherOptions) {
@@ -42,6 +43,10 @@ export class SemanticObjcIndexStoreWatcher {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
     }
+    if (this.quiescenceRetryTimer) {
+      clearTimeout(this.quiescenceRetryTimer);
+      this.quiescenceRetryTimer = null;
+    }
     this.scheduler.stop();
     this.watcher?.close();
     this.watcher = null;
@@ -51,8 +56,18 @@ export class SemanticObjcIndexStoreWatcher {
     return !!this.watcher;
   }
 
+  hasPendingWork(): boolean {
+    return this.pendingTimer !== null ||
+      this.quiescenceRetryTimer !== null ||
+      this.scheduler.status() !== 'fresh';
+  }
+
   notifyChanged(): void {
     if (this.pendingTimer) clearTimeout(this.pendingTimer);
+    if (this.quiescenceRetryTimer) {
+      clearTimeout(this.quiescenceRetryTimer);
+      this.quiescenceRetryTimer = null;
+    }
     this.opts.onState?.('queued', 'indexstore-changed');
     this.pendingTimer = setTimeout(() => {
       this.pendingTimer = null;
@@ -74,6 +89,16 @@ export class SemanticObjcIndexStoreWatcher {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       this.opts.onState?.('stale', reason);
+      this.scheduleQuiescenceRetry();
     }
+  }
+
+  private scheduleQuiescenceRetry(): void {
+    if (this.quiescenceRetryTimer) return;
+    this.quiescenceRetryTimer = setTimeout(() => {
+      this.quiescenceRetryTimer = null;
+      void this.runAfterQuiescence();
+    }, this.opts.config.quiescence.sampleIntervalMs);
+    this.quiescenceRetryTimer.unref?.();
   }
 }

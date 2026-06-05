@@ -101,6 +101,15 @@ export class MCPEngine {
     return this.toolHandler.hasDefaultCodeGraph();
   }
 
+  /** Whether all background sync/enrichment work has drained. */
+  isIdle(): boolean {
+    return !this.cg || (
+      !this.cg.isIndexing() &&
+      !this.cg.hasPendingWatchSync() &&
+      !this.semanticObjcWatcher?.hasPendingWork()
+    );
+  }
+
   /**
    * Walk up from `searchFrom` to find the nearest `.codegraph/` and open it.
    * Idempotent: concurrent callers share one in-flight init; subsequent
@@ -287,8 +296,13 @@ export class MCPEngine {
     };
     this.semanticObjcWatcher = new SemanticObjcIndexStoreWatcher(watcherOptions);
     const started = this.semanticObjcWatcher.start();
-    if (started && config.fallback === 'stale-then-idle-reconcile' && cg.getSemanticObjcState().status === 'stale') {
-      this.semanticObjcWatcher.enqueueReconcile('startup-stale-reconcile');
+    const semanticObjcState = cg.getSemanticObjcState();
+    if (
+      started &&
+      config.fallback === 'stale-then-idle-reconcile' &&
+      (semanticObjcState.status === 'stale' || semanticObjcState.status === 'queued' || semanticObjcState.status === 'running')
+    ) {
+      this.semanticObjcWatcher.enqueueReconcile(`startup-${semanticObjcState.status}-reconcile`);
     }
     if (started) {
       process.stderr.write(

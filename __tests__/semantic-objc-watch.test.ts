@@ -332,6 +332,69 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
     }
   });
 
+  it('retries the latest queued semantic work after queue-full coalescing', async () => {
+    vi.useFakeTimers();
+    const states: string[] = [];
+    let idle = false;
+    const runs: string[] = [];
+    const scheduler = new SemanticObjcIdleScheduler({
+      maxQueueDepth: 1,
+      isIdle: () => idle,
+      retryDelaysMs: [5],
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+    });
+
+    try {
+      await expect(scheduler.enqueue(async () => { runs.push('first'); })).resolves.toEqual({ ran: false, reason: 'graph-busy' });
+      await expect(scheduler.enqueue(async () => { runs.push('latest'); })).resolves.toEqual({ ran: false, reason: 'semantic-queue-full' });
+      idle = true;
+      await vi.advanceTimersByTimeAsync(5);
+      expect(runs).toEqual(['latest']);
+      expect(states).toContain('queued:semantic-queue-full');
+      expect(states).toContain('fresh');
+    } finally {
+      scheduler.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries semantic work after IndexStore quiescence times out and later becomes stable', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    const unitPath = path.join(storePath, 'unit');
+    fs.writeFileSync(unitPath, 'seed');
+    const states: string[] = [];
+    let runs = 0;
+    const config = parseSemanticObjcWatchConfig({ enabled: true, watchIndexStore: true, storePath });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 3, maxWaitMs: 5 };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => { runs++; },
+    });
+
+    const churn = setInterval(() => {
+      fs.appendFileSync(unitPath, 'x');
+    }, 1);
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(20);
+      clearInterval(churn);
+      expect(runs).toBe(0);
+      expect(states.some((state) => state.startsWith('stale:IndexStore did not become quiescent'))).toBe(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(runs).toBe(1);
+      expect(states).toContain('fresh');
+    } finally {
+      clearInterval(churn);
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('persists queued semantic ObjC state without overwriting stale reason', () => {
     const dbPath = path.join(tempDir, '.codegraph', 'codegraph.db');
     const conn = DatabaseConnection.initialize(dbPath);
