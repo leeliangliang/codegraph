@@ -26,7 +26,10 @@ export const DEFAULT_SEMANTIC_OBJC_WATCH_CONFIG: SemanticObjcWatchConfig = {
   watchIndexStore: false,
   storePath: null,
   helperPath: null,
-  languages: ['objc', 'swift'],
+  // C/C++ are covered by the same clang IndexStore (overload resolution,
+  // templates, virtual dispatch — what tree-sitter can't do). Enabled by
+  // default so any clang-built target (Xcode, CMake, SwiftPM) is enriched.
+  languages: ['objc', 'swift', 'c', 'cpp'],
   deltaMode: 'unit',
   fallback: 'stale-then-idle-reconcile',
   quiescence: DEFAULT_INDEXSTORE_QUIESCENCE,

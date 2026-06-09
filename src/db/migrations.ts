@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Migration definition
@@ -123,6 +123,16 @@ const migrations: Migration[] = [
           ON semantic_objc_node_ownership(node_id);
         CREATE INDEX IF NOT EXISTS idx_semantic_objc_node_ownership_file_path
           ON semantic_objc_node_ownership(file_path);
+      `);
+    },
+  },
+  {
+    version: 7,
+    description: 'Add nodes.is_test for compiler-confirmed unit-test symbols (IndexStoreDB unitTest property)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN is_test INTEGER DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_nodes_is_test ON nodes(is_test);
       `);
     },
   },

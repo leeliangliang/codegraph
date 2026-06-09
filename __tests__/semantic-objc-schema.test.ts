@@ -131,7 +131,7 @@ describe('Semantic ObjC schema', () => {
     const conn = DatabaseConnection.open(dbPath);
     const db = conn.getDb();
 
-    expect(conn.getSchemaVersion()?.version).toBe(6);
+    expect(conn.getSchemaVersion()?.version).toBe(7);
     expect(tableExists(db, 'semantic_objc_state')).toBe(true);
     expect(tableExists(db, 'semantic_objc_units')).toBe(true);
     expect(tableExists(db, 'semantic_objc_unit_files')).toBe(true);

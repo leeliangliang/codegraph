@@ -1263,6 +1263,22 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'indexstore-dynamic-dispatch') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'an abstract method';
+      return {
+        label: `Obj-C/Swift dynamic dispatch — message ${via} resolves to this override (compiler-resolved)`,
+        compact: `dynamic: ${via} → impl${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'indexstore-indirect-ref') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a callable';
+      return {
+        label: `indirect dispatch — ${via} referenced as a selector / function value, invoked later (compiler-resolved)`,
+        compact: `dynamic: ${via} via selector/fn-ref${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 

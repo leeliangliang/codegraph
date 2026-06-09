@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
     usr TEXT, -- Optional Clang/Swift USR; populated by IndexStoreDB enrichment on macOS
+    is_test INTEGER DEFAULT 0, -- 1 when IndexStoreDB marks the symbol as a unit test
     updated_at INTEGER NOT NULL
 );
 

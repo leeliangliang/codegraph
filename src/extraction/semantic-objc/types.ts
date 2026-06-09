@@ -60,13 +60,25 @@ export interface XcSymRecord {
   isSystem: boolean;
   /** True iff the symbol is an Objective-C category (`kind === 'extension'`, `lang === 'objc'`). */
   category?: boolean;
+  /**
+   * IndexStoreDB SymbolProperty tokens present on this symbol, e.g.
+   * `ibAnnotated`, `ibOutletCollection`, `unitTest`, `swiftAsync`, `generic`,
+   * `templateSpecialization`, `protocolInterface`. Absent when none apply.
+   */
+  props?: string[];
 }
 
 /** A reference to a symbol — a call site, a read, a write, or a generic reference. */
 export interface XcRefRecord {
   t: 'ref';
   to_usr: string;
-  role: 'call' | 'read' | 'write' | 'reference';
+  /**
+   * `call` — direct call. `read`/`write` — data access. `reference` — a
+   * non-call mention (includes Swift `#selector` / function values, which the
+   * indexer records as references to the method). `selector` — an `addressOf`
+   * occurrence (`@selector` / `&func` taken as a value).
+   */
+  role: 'call' | 'read' | 'write' | 'reference' | 'selector';
   file: string;
   line: number;
   col: number;
@@ -81,9 +93,37 @@ export interface XcRefRecord {
  */
 export interface XcRelRecord {
   t: 'rel';
-  kind: 'override' | 'base' | 'extended' | 'accessor' | 'receivedBy';
+  kind: 'override' | 'base' | 'extended' | 'accessor' | 'receivedBy' | 'ibType' | 'specialization';
   parent: string;
   child: string;
+}
+
+/**
+ * A `#include` / `#import` edge between two in-project files (both endpoints
+ * resolved to project file nodes; system-header targets are filtered out by
+ * the helper). Drives the file-level header dependency graph.
+ */
+export interface XcIncludeRecord {
+  t: 'inc';
+  /** Including file (relative to sourceRoot when possible, else absolute). */
+  from: string;
+  /** Included file. */
+  to: string;
+  line: number;
+}
+
+/**
+ * A forward declaration of a symbol whose definition lives elsewhere — e.g. an
+ * Objective-C method's `.h` `@interface` declaration vs its `.m`
+ * `@implementation`. `usr` is the definition's USR, so the Node side can link
+ * the declaration node to the definition node.
+ */
+export interface XcDeclRecord {
+  t: 'dcl';
+  usr: string;
+  file: string;
+  line: number;
+  col: number;
 }
 
 /** Trailer with counts. Last line of any helper run. */
@@ -102,6 +142,8 @@ export type XcRecord =
   | XcSymRecord
   | XcRefRecord
   | XcRelRecord
+  | XcIncludeRecord
+  | XcDeclRecord
   | XcDoneRecord;
 
 export interface SemanticDeltaCapability {
@@ -131,6 +173,8 @@ export function isXcRecord(value: unknown): value is XcRecord {
     t === 'sym' ||
     t === 'ref' ||
     t === 'rel' ||
+    t === 'inc' ||
+    t === 'dcl' ||
     t === 'done'
   );
 }

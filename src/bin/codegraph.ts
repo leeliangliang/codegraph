@@ -1874,6 +1874,9 @@ program
           console.log(`  Enriched:            ${chalk.green(formatNumber(summary.symsMerged))} (usr populated)`);
           console.log(`  Outside project:     ${formatNumber(summary.symsOutsideProject)} (DerivedData / frameworks)`);
           console.log(`  No matching node:    ${formatNumber(summary.symsNotMatched)}`);
+          console.log(`  IB-annotated:        ${chalk.green(formatNumber(summary.ibSymbolsMarked))} (IBOutlet / IBAction)`);
+          console.log(`  Marked async:        ${chalk.green(formatNumber(summary.asyncSymbolsMarked))}`);
+          console.log(`  Marked test:         ${chalk.green(formatNumber(summary.testSymbolsMarked))}`);
           console.log(chalk.dim('Units (for incremental refresh)'));
           console.log(`  Seen:                ${formatNumber(summary.unitsSeen)}`);
           console.log(`  Units stored:        ${chalk.green(formatNumber(summary.unitsMerged))}`);
@@ -1884,14 +1887,22 @@ program
           console.log(`  Edges added:         ${chalk.green(formatNumber(summary.relsMerged))}`);
           console.log(`  Endpoint missing:    ${formatNumber(summary.relsSkipped)}`);
           console.log(`  Already present:     ${formatNumber(summary.relsAlreadyPresent)}`);
+          console.log(`  Framework callbacks: ${chalk.green(formatNumber(summary.frameworkConformanceMarked))} (delegate / lifecycle overrides)`);
+          console.log(`  Include edges:       ${chalk.green(formatNumber(summary.includeEdgesMerged))} (#import graph)`);
+          console.log(`  Decl→def edges:      ${chalk.green(formatNumber(summary.declEdgesMerged))} (.h → .m)`);
           console.log(chalk.dim('Call references (semantic call edges)'));
           console.log(`  Seen:                ${formatNumber(summary.refsSeen)}`);
           console.log(`  Call edges added:    ${chalk.green(formatNumber(summary.refsMerged))}`);
-          console.log(`  Non-call (read/write skipped): ${formatNumber(summary.refsNonCall)}`);
+          console.log(`  Data-flow edges added: ${chalk.green(formatNumber(summary.refsDataflowMerged))} (read/write references)`);
           console.log(`  Outside project:     ${formatNumber(summary.refsOutsideProject)}`);
           console.log(`  No source node:      ${formatNumber(summary.refsNoSource)}`);
           console.log(`  No target node:      ${formatNumber(summary.refsNoTarget)}`);
-          console.log(`  Already present:     ${formatNumber(summary.refsAlreadyPresent)}`);
+          console.log(`  Already present:     ${formatNumber(summary.refsAlreadyPresent + summary.refsDataflowAlreadyPresent)}`);
+          console.log('');
+          console.log(chalk.dim('Dynamic / indirect dispatch (compiler-resolved)'));
+          console.log(`  Resolved call sites: ${formatNumber(summary.dynamicCallSitesResolved)}`);
+          console.log(`  Impl edges added:    ${chalk.green(formatNumber(summary.dynamicDispatchSynthesized))}`);
+          console.log(`  Selector/fn-ref edges: ${chalk.green(formatNumber(summary.selectorEdgesSynthesized))}`);
         }
       } finally {
         conn.close();

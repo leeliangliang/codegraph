@@ -67,9 +67,20 @@ struct Queries {
                 for ref in refs {
                     if !includeSystem && ref.location.isSystem { continue }
                     indexedFiles.insert(ref.location.path)
-                    let isDeclOrDef = ref.roles.contains(.declaration) || ref.roles.contains(.definition)
+                    let isDecl = ref.roles.contains(.declaration)
+                    let isDef = ref.roles.contains(.definition)
+                    let isDeclOrDef = isDecl || isDef
+                    // A forward declaration at a different site than the
+                    // canonical (definition) occurrence — e.g. the `.h`
+                    // `@interface` method vs the `.m` `@implementation`. Emit a
+                    // `dcl` record so the Node side can link decl → def.
+                    if isDecl && !isDef
+                        && !(ref.location.path == occ.location.path && ref.location.line == occ.location.line) {
+                        emitDecl(ref, defUSR: usr)
+                    }
                     if !isDeclOrDef && (ref.roles.contains(.reference) || ref.roles.contains(.call)
-                        || ref.roles.contains(.read) || ref.roles.contains(.write)) {
+                        || ref.roles.contains(.read) || ref.roles.contains(.write)
+                        || ref.roles.contains(.addressOf)) {
                         emitRef(ref, calleeUSR: usr)
                         refCount += 1
                     }
@@ -101,9 +112,30 @@ struct Queries {
         if roles.contains(.extendedBy) { return "extended" }
         if roles.contains(.accessorOf) { return "accessor" }
         if roles.contains(.receivedBy) { return "receivedBy" }
+        // An Interface Builder outlet/action declares a type — `ibType` links the
+        // IB-annotated symbol to the class it's wired to. `specialization` links
+        // a generic/template instantiation back to its generic declaration.
+        if roles.contains(.ibTypeOf) { return "ibType" }
+        if roles.contains(.specializationOf) { return "specialization" }
         // childOf / containedBy are common containment relations — we skip them
         // because tree-sitter already captures structural containment.
         return nil
+    }
+
+    /// The IndexStoreDB SymbolProperty flags CodeGraph consumes, as stable
+    /// string tokens. Drives IB annotation, unit-test tagging, async marking,
+    /// and generic/template-specialization handling on the Node side.
+    private func symbolPropertyTokens(_ p: SymbolProperty) -> [String] {
+        var tokens: [String] = []
+        if p.contains(.ibAnnotated) { tokens.append("ibAnnotated") }
+        if p.contains(.ibOutletCollection) { tokens.append("ibOutletCollection") }
+        if p.contains(.unitTest) { tokens.append("unitTest") }
+        if p.contains(.swiftAsync) { tokens.append("swiftAsync") }
+        if p.contains(.generic) { tokens.append("generic") }
+        if p.contains(.templateSpecialization) { tokens.append("templateSpecialization") }
+        if p.contains(.templatePartialSpecialization) { tokens.append("templatePartialSpecialization") }
+        if p.contains(.protocolInterface) { tokens.append("protocolInterface") }
+        return tokens
     }
 
     // MARK: - NDJSON emission
@@ -130,9 +162,9 @@ struct Queries {
         write([
             "t": "cap",
             "semanticDeltaVersion": 1,
-            "helperVersion": "codegraph-xchelper 1.0.0",
+            "helperVersion": "codegraph-xchelper 1.1.0",
             "unitFingerprintAlgorithm": "index-unit-v1",
-            "recordKinds": ["unit", "unit_file", "sym", "rel", "ref"],
+            "recordKinds": ["unit", "unit_file", "sym", "rel", "ref", "inc", "dcl"],
             "sourceMembership": true,
         ])
     }
@@ -151,7 +183,42 @@ struct Queries {
             for file in files {
                 emitUnitFile(unitName: unitName, file: file)
             }
+            emitIncludes(unitName: unitName)
         }
+    }
+
+    /// Emit the `#include` / `#import` edges of a translation unit as `inc`
+    /// records. Only edges whose *source* file is inside the project are
+    /// emitted (the target may still be a system header — the Node side drops
+    /// targets that don't resolve to a project file node). Deduped per unit.
+    private func emitIncludes(unitName: String) {
+        var seen = Set<String>()
+        for entry in db.includesOfUnit(unitName: unitName) {
+            // Both endpoints must be in-project — an `#import` of a system
+            // header (Foundation, the SDK) has no project file node to link to.
+            guard isInProject(entry.sourcePath), isInProject(entry.targetPath) else { continue }
+            let key = "\(entry.sourcePath)\u{0}\(entry.targetPath)"
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            write([
+                "t": "inc",
+                "from": relativize(entry.sourcePath),
+                "to": relativize(entry.targetPath),
+                "line": entry.line,
+            ])
+        }
+    }
+
+    /// Symlink-robust "is this path inside the source root?" check. macOS keeps
+    /// `/var` and `/tmp` as symlinks to `/private/var` and `/private/tmp`, and
+    /// `resolvingSymlinksInPath` doesn't collapse them — so the indexer's
+    /// `/private/var/...` paths wouldn't `hasPrefix` a `/var/...` root. Strip a
+    /// leading `/private` from both sides before comparing.
+    private func isInProject(_ path: String) -> Bool {
+        func stripPrivate(_ p: String) -> String {
+            return p.hasPrefix("/private/") ? String(p.dropFirst("/private".count)) : p
+        }
+        return stripPrivate(path).hasPrefix(stripPrivate(sourceRoot))
     }
 
     private func emitUnit(unitName: String, files: [String]) {
@@ -224,12 +291,23 @@ struct Queries {
         if isCategory {
             obj["category"] = true
         }
+        let props = symbolPropertyTokens(occ.symbol.properties)
+        if !props.isEmpty {
+            obj["props"] = props
+        }
         write(obj)
     }
 
     private func emitRef(_ occ: SymbolOccurrence, calleeUSR: String) {
         let role: String
-        if occ.roles.contains(.call) { role = "call" }
+        // `addressOf` first: `@selector(foo)` / `#selector(foo)` / `&func`
+        // reference a method or function as a callable value rather than
+        // calling it directly — the target-action / function-pointer indirect
+        // dispatch the merger turns into a selector edge. Checked before
+        // call/read/write because a selector occurrence may also carry
+        // `.reference`, and we want the more specific classification.
+        if occ.roles.contains(.addressOf) { role = "selector" }
+        else if occ.roles.contains(.call) { role = "call" }
         else if occ.roles.contains(.read) { role = "read" }
         else if occ.roles.contains(.write) { role = "write" }
         else { role = "reference" }
@@ -242,6 +320,16 @@ struct Queries {
             "line": occ.location.line,
             "col": occ.location.utf8Column,
             "dynamic": occ.roles.contains(.dynamic),
+        ])
+    }
+
+    private func emitDecl(_ occ: SymbolOccurrence, defUSR: String) {
+        write([
+            "t": "dcl",
+            "usr": defUSR,
+            "file": relativize(occ.location.path),
+            "line": occ.location.line,
+            "col": occ.location.utf8Column,
         ])
     }
 

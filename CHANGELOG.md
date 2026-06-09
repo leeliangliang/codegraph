@@ -12,6 +12,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
+- On macOS, the optional Objective-C / Swift semantic enrichment now resolves much more of the call graph from Xcode's compiler index. A dynamic message send like `[obj doThing]` now connects to the concrete method implementations that can actually run, so an agent can follow the flow through dynamic dispatch instead of stopping at an abstract protocol or base method.
+- Target-action and indirect dispatch are now followed: a Swift `#selector(...)` or a function passed as a value links to the method it will invoke, so a handler wired up indirectly no longer looks unreachable.
+- Property reads and writes are now tracked, so you can ask which functions read or write a given property, field, or global — the kind of data-flow question grep can't answer reliably.
+- Interface Builder connections are surfaced: `@IBOutlet` and `@IBAction` symbols are tagged, and delegate methods and lifecycle hooks like `viewDidLoad` that the framework calls (not your code) are marked as framework callbacks, so they're no longer mistaken for dead code.
+- Unit-test methods and `async` functions are tagged from the compiler's own metadata, and a header's declarations link to their implementations (`.h` → `.m`).
+- The `#import` / `#include` header graph is now indexed, so you can see which files a header pulls in.
+- C and C++ are now covered by the same macOS semantic enrichment (overload resolution, templates, and virtual dispatch a syntax-only pass can't see), and CodeGraph now finds the compiler index for non-Xcode builds too — CMake/clang projects built with `-index-store-path` and Swift Package Manager builds, not just Xcode.
 
 ### Fixes
 

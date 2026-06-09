@@ -35,6 +35,14 @@ struct DerivedDataDiscovery {
             throw DiscoveryError.sourceRootMissing(sourceRoot)
         }
 
+        // Non-Xcode stores first: a CMake / plain-clang build pointed at
+        // `-index-store-path`, or a SwiftPM build. These live inside the project
+        // tree — cheaper to find and more specific than scanning all of
+        // DerivedData, and they cover the Xcode-free toolchains.
+        if let inProject = locateInProjectStore(sourceRoot: sourceRoot) {
+            return inProject
+        }
+
         let candidates = derivedDataRoots()
         for root in candidates {
             if let match = try findMatchingStore(under: root, sourceRoot: sourceRoot) {
@@ -42,6 +50,38 @@ struct DerivedDataDiscovery {
             }
         }
         throw DiscoveryError.noStoreFound(searchedRoots: candidates)
+    }
+
+    /// Conventional in-project IndexStore locations for non-Xcode builds:
+    ///   - `<root>/.indexstore` and `<root>/Index.noindex/DataStore`
+    ///     (CMake / plain `clang -index-store-path=...`).
+    ///   - `<root>/.build/{debug,release}/index/store` and
+    ///     `<root>/.build/index-build/index/store` (SwiftPM / SourceKit-LSP).
+    /// Returns the first that looks like a real index store (has a `vN/units`).
+    static func locateInProjectStore(sourceRoot: URL) -> URL? {
+        let candidates = [
+            ".indexstore",
+            "Index.noindex/DataStore",
+            ".build/debug/index/store",
+            ".build/release/index/store",
+            ".build/index-build/index/store",
+        ].map { sourceRoot.appendingPathComponent($0) }
+        return candidates.first(where: isIndexStore)
+    }
+
+    /// A clang/swift IndexStore is a directory with a versioned `vN/units`
+    /// subdirectory (e.g. `v5/units`).
+    static func isIndexStore(_ url: URL) -> Bool {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return false }
+        guard let entries = try? fm.contentsOfDirectory(atPath: url.path) else { return false }
+        for entry in entries where entry.hasPrefix("v") {
+            if fm.fileExists(atPath: url.appendingPathComponent("\(entry)/units").path) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Roots that may contain DerivedData entries. The custom path (if set in Xcode prefs)
