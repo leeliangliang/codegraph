@@ -61,6 +61,83 @@ struct RuntimeError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+// MARK: - Explicit unit discovery
+
+/// Return IndexStore output paths for source files under `sourceRoot`.
+///
+/// IndexStoreDB normally imports every unit in the DataStore before queries can
+/// run. Large DerivedData stores may include old targets, dependencies, and
+/// generated units unrelated to the current project root; importing all of them
+/// expands the transient LMDB map dramatically. `useExplicitOutputUnits` lets us
+/// enqueue only the units whose compiler output paths correspond to source files
+/// in this project.
+func collectExplicitOutputUnitPaths(storeURL: URL, sourceRoot: URL) -> [String] {
+    let fm = FileManager.default
+    let sourceRootURL = sourceRoot.resolvingSymlinksInPath().standardizedFileURL
+    let desiredOutputNames = collectProjectOutputNames(sourceRootURL: sourceRootURL)
+    if desiredOutputNames.isEmpty { return [] }
+
+    var scanRoots: [URL] = []
+    if let derivedRoot = derivedDataRoot(forStoreURL: storeURL) {
+        scanRoots.append(derivedRoot.appendingPathComponent("Build", isDirectory: true))
+    }
+    // Non-Xcode tests and clang/CMake builds often place object files next to
+    // the sources or under an in-project build directory.
+    scanRoots.append(sourceRootURL)
+
+    var seen = Set<String>()
+    var out: [String] = []
+    for root in scanRoots {
+        guard fm.fileExists(atPath: root.path) else { continue }
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { continue }
+
+        for case let url as URL in enumerator {
+            guard desiredOutputNames.contains(url.lastPathComponent) else { continue }
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            let path = url.resolvingSymlinksInPath().standardized.path
+            if seen.insert(path).inserted {
+                out.append(path)
+            }
+        }
+    }
+    return out.sorted()
+}
+
+private func collectProjectOutputNames(sourceRootURL: URL) -> Set<String> {
+    let fm = FileManager.default
+    let sourceExts: Set<String> = ["m", "mm", "c", "cc", "cpp", "cxx", "swift"]
+    var names = Set<String>()
+
+    guard let enumerator = fm.enumerator(
+        at: sourceRootURL,
+        includingPropertiesForKeys: [.isRegularFileKey],
+        options: [.skipsHiddenFiles, .skipsPackageDescendants]
+    ) else { return names }
+
+    for case let url as URL in enumerator {
+        let ext = url.pathExtension.lowercased()
+        guard sourceExts.contains(ext) else { continue }
+        guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+        let base = url.deletingPathExtension().lastPathComponent
+        names.insert("\(base).o")
+        names.insert("\(url.lastPathComponent).o")
+    }
+    return names
+}
+
+private func derivedDataRoot(forStoreURL storeURL: URL) -> URL? {
+    let standardized = storeURL.standardizedFileURL
+    guard standardized.lastPathComponent == "DataStore",
+          standardized.deletingLastPathComponent().lastPathComponent == "Index.noindex" else {
+        return nil
+    }
+    return standardized.deletingLastPathComponent().deletingLastPathComponent()
+}
+
 // MARK: - Root command
 
 struct Xchelper: ParsableCommand {
@@ -124,13 +201,21 @@ struct Dump: ParsableCommand {
         // LMDB needs the directory to already exist (especially with readonly:true).
         // We create it explicitly so the database path is unambiguous regardless of flags.
         try FileManager.default.createDirectory(atPath: tmpDB, withIntermediateDirectories: true)
+        let explicitOutputUnitPaths = collectExplicitOutputUnitPaths(
+            storeURL: storeURL,
+            sourceRoot: URL(fileURLWithPath: sourceRoot)
+        )
         let db = try IndexStoreDB(
             storePath: storeURL.path,
             databasePath: tmpDB,
             library: lib,
-            waitUntilDoneInitializing: true,
+            useExplicitOutputUnits: !explicitOutputUnitPaths.isEmpty,
+            waitUntilDoneInitializing: explicitOutputUnitPaths.isEmpty,
             listenToUnitEvents: false
         )
+        if !explicitOutputUnitPaths.isEmpty {
+            db.addUnitOutFilePaths(explicitOutputUnitPaths, waitForProcessing: true)
+        }
 
         // Parse --language args into the IndexStoreDB Language enum.
         var langs: Set<Language> = []

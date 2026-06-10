@@ -420,7 +420,15 @@ program
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .option('--with-semantic-objc', 'After initial indexing, also run Objective-C / Swift semantic enrichment via Xcode IndexStore (macOS only)')
+  .option('--semantic-objc-helper <path>', 'Path to the codegraph-xchelper Swift binary (overrides discovery)')
+  .option('--semantic-objc-store-path <path>', 'Explicit .indexstore/DataStore directory (overrides discovery)')
+  .action(async (pathArg: string | undefined, options: {
+    index?: boolean; verbose?: boolean;
+    withSemanticObjc?: boolean;
+    semanticObjcHelper?: string;
+    semanticObjcStorePath?: string;
+  }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
@@ -460,6 +468,18 @@ program
         await progress.stop();
       }
       printIndexResult(clack, result, projectPath);
+
+      if (!result.success) {
+        process.exit(1);
+      }
+
+      if (options.withSemanticObjc) {
+        await runSemanticObjcEnrichment(projectPath, {
+          quiet: false,
+          helperPath: options.semanticObjcHelper,
+          storePath: options.semanticObjcStorePath,
+        });
+      }
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -811,6 +831,28 @@ program
       }
       if (semanticObjc.staleReason) {
         console.log(`    Stale reason: ${semanticObjc.staleReason}`);
+      }
+      if (semanticObjc.coverage) {
+        console.log(
+          `    Coverage:     ${formatNumber(semanticObjc.coverage.nodesWithUsr)} nodes with USR, ` +
+          `${formatNumber(semanticObjc.coverage.semanticEdges)} semantic edges`
+        );
+        console.log(
+          `    Units:        ${formatNumber(semanticObjc.coverage.units)} units, ` +
+          `${formatNumber(semanticObjc.coverage.unitFiles)} unit files, ` +
+          `${formatNumber(semanticObjc.coverage.ownershipRows)} ownership rows`
+        );
+      }
+      if (semanticObjc.lastMergeSummary) {
+        console.log(
+          `    Last merge:   syms ${formatNumber(semanticObjc.lastMergeSummary.symsMerged)}/${formatNumber(semanticObjc.lastMergeSummary.symsSeen)}, ` +
+          `refs ${formatNumber(semanticObjc.lastMergeSummary.refsMerged)}/${formatNumber(semanticObjc.lastMergeSummary.refsSeen)}, ` +
+          `units ${formatNumber(semanticObjc.lastMergeSummary.unitsMerged)}/${formatNumber(semanticObjc.lastMergeSummary.unitsSeen)}`
+        );
+      }
+      for (const diagnostic of semanticObjc.diagnostics ?? []) {
+        const label = diagnostic.severity === 'error' ? 'Error' : diagnostic.severity === 'warning' ? 'Warning' : 'Info';
+        console.log(`    ${label}:      ${diagnostic.message}`);
       }
       console.log();
 
@@ -1719,9 +1761,16 @@ async function runSemanticObjcEnrichment(
     markSemanticObjcQueued,
   } = await import('../extraction/semantic-objc');
 
+  const dbPath = getDatabasePath(projectPath);
   const helperPath = opts.helperPath
     ?? locateHelperBinary(path.resolve(__dirname, '../..'));
   if (!helperPath) {
+    const conn = DatabaseConnection.open(dbPath);
+    try {
+      markSemanticObjcFailed(conn.getDb(), 'semantic-enrichment-failed:helper-not-found');
+    } finally {
+      conn.close();
+    }
     if (!opts.quiet) {
       warn(
         'codegraph-xchelper binary not found. Build it once with ' +
@@ -1732,7 +1781,6 @@ async function runSemanticObjcEnrichment(
     return;
   }
 
-  const dbPath = getDatabasePath(projectPath);
   const conn = DatabaseConnection.open(dbPath);
   const queries = new QueryBuilder(conn.getDb());
   const helperSourceRoot = inferSemanticObjcSourceRoot(projectPath, queries);
@@ -1823,9 +1871,16 @@ program
         markSemanticObjcQueued,
       } = await import('../extraction/semantic-objc');
 
+      const dbPath = getDatabasePath(projectPath);
       const helperPath = options.helper
         ?? locateHelperBinary(path.resolve(__dirname, '../..'));
       if (!helperPath) {
+        const conn = DatabaseConnection.open(dbPath);
+        try {
+          markSemanticObjcFailed(conn.getDb(), 'semantic-enrichment-failed:helper-not-found');
+        } finally {
+          conn.close();
+        }
         error(
           'codegraph-xchelper binary not found. Pass --helper <path>, or build it first:\n' +
           '  cd src/extraction/semantic-objc/swift && swift build -c release'
@@ -1833,7 +1888,6 @@ program
         process.exit(1);
       }
 
-      const dbPath = getDatabasePath(projectPath);
       const conn = DatabaseConnection.open(dbPath);
       const queries = new QueryBuilder(conn.getDb());
       const helperSourceRoot = options.sourceRoot ?? inferSemanticObjcSourceRoot(projectPath, queries);

@@ -319,6 +319,8 @@ export class MCPEngine {
       cg.markSemanticObjcQueued(reason ?? 'semantic-queued');
     } else if (status === 'running') {
       cg.markSemanticObjcRunning(reason);
+    } else if (status === 'failed') {
+      cg.markSemanticObjcFailed(reason ?? 'semantic-watch-failed');
     } else if (status === 'stale' && reason) {
       cg.markSemanticObjcStale(reason);
     }

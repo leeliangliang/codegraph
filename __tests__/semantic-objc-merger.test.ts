@@ -21,6 +21,8 @@ import {
   findLocalHelperBinary,
   getSemanticObjcState,
   inferSemanticObjcSourceRoot,
+  markSemanticObjcMergeCompleted,
+  markSemanticObjcStale,
   mergeFromHelper,
   recordSourceHandle,
   canonicaliseSymPath,
@@ -192,7 +194,7 @@ describe('semantic-objc mergeFromHelper — Phase A (sym → usr)', () => {
 });
 
 describe('semantic-objc mergeFromHelper — delta metadata persistence', () => {
-  it('persists unit, source membership, ownership rows, and fresh state', async () => {
+  it('persists unit, source membership, ownership rows, merge summary, and fresh state', async () => {
     seedNode('n1', 'class', 'MyVC', 'Sources/MyVC.m', 12);
 
     const handle = recordSourceHandle(synth([
@@ -236,7 +238,119 @@ describe('semantic-objc mergeFromHelper — delta metadata persistence', () => {
       usr: 'c:objc(cs)MyVC',
       ownership: 'exclusive',
     });
-    expect(getSemanticObjcState(conn.getDb()).status).toBe('fresh');
+
+    const state = getSemanticObjcState(conn.getDb());
+    expect(state.status).toBe('fresh');
+    expect(state.lastMergeCompletedAt).toEqual(expect.any(Number));
+    expect(state.lastMergeSummary).toMatchObject({
+      symsSeen: 1,
+      symsMerged: 1,
+      unitsSeen: 1,
+      unitsMerged: 1,
+      unitFilesSeen: 1,
+      unitFilesMerged: 1,
+      ownershipRowsMerged: 1,
+    });
+    expect(state.coverage).toMatchObject({
+      nodesWithUsr: 1,
+      semanticEdges: 0,
+      semanticCallEdges: 0,
+      semanticNonCallEdges: 0,
+      units: 1,
+      unitFiles: 1,
+      ownershipRows: 1,
+    });
+  });
+
+  it('ignores invalid stored merge summary JSON', () => {
+    conn.getDb().prepare(
+      'INSERT OR REPLACE INTO semantic_objc_state (key, value, updated_at) VALUES (?, ?, ?)'
+    ).run('last_merge_summary_json', '{not json', Date.now());
+
+    expect(() => getSemanticObjcState(conn.getDb())).not.toThrow();
+    expect(getSemanticObjcState(conn.getDb()).lastMergeSummary).toBeUndefined();
+  });
+
+  it('reports coverage and diagnostics for partial semantic state', () => {
+    seedNode('source', 'method', 'load', 'Sources/MyVC.m', 10);
+    seedNode('target', 'method', 'render', 'Sources/MyVC.m', 20);
+    conn.getDb().prepare('UPDATE nodes SET usr = ? WHERE id = ?').run('usr:source', 'source');
+    conn.getDb().prepare(`
+      INSERT INTO edges (source, target, kind, metadata, line, col, provenance)
+      VALUES (?, ?, 'calls', NULL, NULL, NULL, 'semantic-objc')
+    `).run('source', 'target');
+    markSemanticObjcMergeCompleted(conn.getDb(), {
+      symsSeen: 2,
+      symsMerged: 0,
+      symsOutsideProject: 0,
+      symsNotMatched: 2,
+      unitsSeen: 0,
+      unitsMerged: 0,
+      unitFilesSeen: 0,
+      unitFilesMerged: 0,
+      ownershipRowsMerged: 0,
+      relsSeen: 0,
+      relsMerged: 0,
+      relsSkipped: 0,
+      relsAlreadyPresent: 0,
+      refsSeen: 10,
+      refsMerged: 0,
+      refsOutsideProject: 0,
+      refsNoSource: 0,
+      refsNoTarget: 9,
+      refsAlreadyPresent: 0,
+      refsNonCall: 0,
+    }, 1234);
+    markSemanticObjcStale(conn.getDb(), 'database locked by another process', 1235);
+
+    const state = getSemanticObjcState(conn.getDb());
+    expect(state.coverage).toMatchObject({
+      nodesWithUsr: 1,
+      semanticEdges: 1,
+      semanticCallEdges: 1,
+      semanticNonCallEdges: 0,
+      units: 0,
+      unitFiles: 0,
+      ownershipRows: 0,
+    });
+    expect(state.diagnostics?.map((diag) => diag.code)).toEqual(expect.arrayContaining([
+      'semantic-objc-units-missing-with-edges',
+      'semantic-objc-helper-no-units',
+      'semantic-objc-symbols-not-matching',
+      'semantic-objc-refs-no-target-high',
+      'semantic-objc-lock-failure',
+    ]));
+  });
+
+  it('reports fresh-without-merged-units when helper saw units but metadata is empty', () => {
+    markSemanticObjcMergeCompleted(conn.getDb(), {
+      symsSeen: 1,
+      symsMerged: 1,
+      symsOutsideProject: 0,
+      symsNotMatched: 0,
+      unitsSeen: 2,
+      unitsMerged: 2,
+      unitFilesSeen: 3,
+      unitFilesMerged: 3,
+      ownershipRowsMerged: 0,
+      relsSeen: 0,
+      relsMerged: 0,
+      relsSkipped: 0,
+      relsAlreadyPresent: 0,
+      refsSeen: 0,
+      refsMerged: 0,
+      refsOutsideProject: 0,
+      refsNoSource: 0,
+      refsNoTarget: 0,
+      refsAlreadyPresent: 0,
+      refsNonCall: 0,
+    }, 1000);
+    conn.getDb().prepare(
+      'INSERT OR REPLACE INTO semantic_objc_state (key, value, updated_at) VALUES (?, ?, ?)'
+    ).run('status', 'fresh', 1000);
+
+    const state = getSemanticObjcState(conn.getDb());
+    expect(state.diagnostics?.map((diag) => diag.code)).toContain('semantic-objc-fresh-without-merged-units');
   });
 });
 
@@ -587,6 +701,49 @@ describe('semantic-objc merger — Phase D dynamic dispatch resolution', () => {
       expect(m.dynamic).toBe(true);
       expect(m.registeredAt).toBe('Sources/Calc.m:8');
     }
+  });
+
+  it('uses receivedBy receiver narrowing to avoid fanning out to unrelated overrides', async () => {
+    seedNode('caller', 'method', 'total', 'Sources/Calc.m', 6, 10);
+    seedNode('abstract', 'method', 'area', 'Sources/Shapes.h', 3, 3);
+    seedNode('circleClass', 'class', 'Circle', 'Sources/Shapes.h', 10, 12);
+    seedNode('squareClass', 'class', 'Square', 'Sources/Shapes.h', 20, 22);
+    seedNode('circle', 'method', 'area', 'Sources/Circle.m', 3, 4);
+    seedNode('square', 'method', 'area', 'Sources/Square.m', 3, 4);
+
+    const narrowedRecords: XcRecord[] = [
+      { t: 'sym', usr: 'c:objc(pl)Shape(im)area', name: 'area', kind: 'instanceMethod', lang: 'objc',
+        file: 'Sources/Shapes.h', line: 3, col: 1, isDecl: true, isDef: false, isSystem: false },
+      { t: 'sym', usr: 'c:objc(cs)Circle', name: 'Circle', kind: 'class', lang: 'objc',
+        file: 'Sources/Shapes.h', line: 10, col: 1, isDecl: true, isDef: false, isSystem: false },
+      { t: 'sym', usr: 'c:objc(cs)Square', name: 'Square', kind: 'class', lang: 'objc',
+        file: 'Sources/Shapes.h', line: 20, col: 1, isDecl: true, isDef: false, isSystem: false },
+      { t: 'sym', usr: 'c:objc(cs)Circle(im)area', name: 'area', kind: 'instanceMethod', lang: 'objc',
+        file: 'Sources/Circle.m', line: 3, col: 1, isDecl: false, isDef: true, isSystem: false },
+      { t: 'sym', usr: 'c:objc(cs)Square(im)area', name: 'area', kind: 'instanceMethod', lang: 'objc',
+        file: 'Sources/Square.m', line: 3, col: 1, isDecl: false, isDef: true, isSystem: false },
+      // `[circle area]` indexes as a dynamic call to the protocol/base method,
+      // plus a `receivedBy` relation that identifies the concrete receiver class.
+      { t: 'ref', to_usr: 'c:objc(pl)Shape(im)area', role: 'call',
+        file: 'Sources/Calc.m', line: 8, col: 40, dynamic: true },
+      { t: 'rel', kind: 'receivedBy', parent: 'c:objc(cs)Circle', child: 'c:objc(pl)Shape(im)area',
+        file: 'Sources/Calc.m', line: 8, col: 40 },
+      { t: 'rel', kind: 'override', parent: 'c:objc(pl)Shape(im)area', child: 'c:objc(cs)Circle(im)area' },
+      { t: 'rel', kind: 'override', parent: 'c:objc(pl)Shape(im)area', child: 'c:objc(cs)Square(im)area' },
+      { t: 'done', symbols: 5, refs: 1, rels: 3 },
+    ];
+
+    const summary = await mergeFromHelper(conn.getDb(), recordSourceHandle(synth(narrowedRecords)), {
+      projectRoot: '/proj', helperSourceRoot: '/proj',
+    });
+
+    expect(summary.dynamicCallSitesResolved).toBe(1);
+    expect(summary.dynamicDispatchSynthesized).toBe(1);
+
+    const synthEdges = conn.getDb().prepare(
+      "SELECT target FROM edges WHERE source='caller' AND kind='calls' AND provenance='heuristic' ORDER BY target"
+    ).all() as Array<{ target: string }>;
+    expect(synthEdges.map((e) => e.target)).toEqual(['circle']);
   });
 
   it('is idempotent — re-running does not duplicate synthesized impl edges', async () => {

@@ -47,7 +47,7 @@ import type {
   XcUnitFileRecord,
   XcUnitRecord,
 } from './types';
-import { markSemanticObjcFresh } from './state';
+import { markSemanticObjcFresh, markSemanticObjcMergeCompleted } from './state';
 import { planSemanticObjcDelta, type StoredSemanticObjcUnit } from './delta';
 import { applySemanticObjcDeltaRewrite } from './rewrite';
 
@@ -102,6 +102,10 @@ function ibDecoratorsFor(props: string[], kind: string | undefined): string[] {
 function frameworkSymbolName(usr: string): string | null {
   const m = /objc\((?:pl|cs)\)([^()]+)\(/.exec(usr);
   return m?.[1] ?? null;
+}
+
+function isObjcMethodUSRForClass(methodUSR: string, classUSR: string): boolean {
+  return methodUSR.startsWith(`${classUSR}(im)`) || methodUSR.startsWith(`${classUSR}(cm)`);
 }
 
 function genericDecoratorsFor(props: string[]): string[] {
@@ -310,12 +314,12 @@ export async function mergeFromHelper(
   // Phase D (dynamic dispatch) statements: every resolved semantic call, the
   // concrete overriders of a given abstract method, and node name/path.
   const findSemanticCallEdgesStmt = db.prepare(
-    "SELECT source, target, line, metadata FROM edges WHERE kind = 'calls' AND provenance = 'semantic-objc'"
+    "SELECT source, target, line, col, metadata FROM edges WHERE kind = 'calls' AND provenance = 'semantic-objc'"
   );
   const findOverridersOfStmt = db.prepare(
     "SELECT source FROM edges WHERE target = ? AND kind = 'override' AND provenance = 'semantic-objc'"
   );
-  const findNodeMetaStmt = db.prepare('SELECT name, file_path FROM nodes WHERE id = ? LIMIT 1');
+  const findNodeMetaStmt = db.prepare('SELECT name, kind, file_path, usr FROM nodes WHERE id = ? LIMIT 1');
   const findFileNodeStmt = db.prepare(
     "SELECT id FROM nodes WHERE file_path = ? AND kind = 'file' LIMIT 1"
   );
@@ -641,10 +645,26 @@ export async function mergeFromHelper(
     // it inline as a dynamic-dispatch hop. This is strictly more precise than
     // the tree-sitter `interface-impl` / `cpp-override` heuristics: the override
     // set comes from the compiler, not from name-matching.
+    // Callsite-specific receiver refinements from IndexStore. `receivedBy`
+    // means: at this occurrence, the dynamic send's receiver is this concrete
+    // class. Keep this separate from the graph-level relation edge because the
+    // same abstract method can be received by many classes at many callsites.
+    const receiverUSRsByCallsite = new Map<string, string[]>();
+    for (const rel of relBuffer) {
+      if (rel.kind !== 'receivedBy' || !rel.file || rel.line == null || rel.col == null) continue;
+      const filePath = canonicaliseSymPath(rel.file, helperRoot, projectRoot);
+      if (filePath === null) continue;
+      const key = `${rel.child}\0${filePath}\0${rel.line}\0${rel.col}`;
+      const values = receiverUSRsByCallsite.get(key) ?? [];
+      values.push(rel.parent);
+      receiverUSRsByCallsite.set(key, values);
+    }
+
     const semanticCallEdges = findSemanticCallEdgesStmt.all() as Array<{
       source: string;
       target: string;
       line: number | null;
+      col: number | null;
       metadata: string | null;
     }>;
     for (const edge of semanticCallEdges) {
@@ -658,15 +678,39 @@ export async function mergeFromHelper(
 
       const overriders = findOverridersOfStmt.all(edge.target) as Array<{ source: string }>;
       if (overriders.length === 0) continue;
+
+      // `receivedBy` is IndexStore's receiver-type refinement for a dynamic send.
+      // On a call like `[_faceTask initTask]`, the semantic call may point to the
+      // overridable superclass method (`BEAlgorithmTask.initTask`) while the
+      // relation says the receiver is `BEFaceAlgorithmTask`. Without this filter,
+      // Phase D fans out to EVERY override of `initTask`, which is exactly the
+      // kind of partial/over-broad dynamic coverage that makes agents read again.
+      // Prefer receiver-compatible overrides; fall back to all overriders only
+      // when the helper/indexer provided no usable receiver narrowing.
+      const abstractNode = findNodeMetaStmt.get(edge.target) as { name?: string; usr?: string | null } | undefined;
+      const callerNode = findNodeMetaStmt.get(edge.source) as { file_path?: string } | undefined;
+      const callsiteKey =
+        abstractNode?.usr && callerNode?.file_path && edge.line != null && edge.col != null
+          ? `${abstractNode.usr}\0${callerNode.file_path}\0${edge.line}\0${edge.col}`
+          : null;
+      const receiverUSRs = callsiteKey ? (receiverUSRsByCallsite.get(callsiteKey) ?? []) : [];
+      const narrowedOverriders = receiverUSRs.length > 0
+        ? overriders.filter((overrider) => {
+            const node = findNodeMetaStmt.get(overrider.source) as { usr?: string | null } | undefined;
+            return typeof node?.usr === 'string' && receiverUSRs.some((receiverUSR) =>
+              isObjcMethodUSRForClass(node.usr!, receiverUSR)
+            );
+          })
+        : [];
+      const dispatchTargets = narrowedOverriders.length > 0 ? narrowedOverriders : overriders;
+      if (dispatchTargets.length === 0) continue;
       summary.dynamicCallSitesResolved++;
 
-      const abstractNode = findNodeMetaStmt.get(edge.target) as { name?: string } | undefined;
-      const callerNode = findNodeMetaStmt.get(edge.source) as { file_path?: string } | undefined;
       const via = abstractNode?.name ?? 'dynamic dispatch';
       const registeredAt =
         callerNode?.file_path && edge.line != null ? `${callerNode.file_path}:${edge.line}` : undefined;
 
-      for (const overrider of overriders) {
+      for (const overrider of dispatchTargets) {
         if (overrider.source === edge.source || overrider.source === edge.target) continue;
         if (checkEdgeStmt.get(edge.source, overrider.source, 'calls', 'heuristic')) {
           summary.dynamicDispatchAlreadyPresent++;
@@ -719,6 +763,28 @@ export async function mergeFromHelper(
       summary.declEdgesMerged++;
     }
 
+    markSemanticObjcMergeCompleted(db, {
+      symsSeen: summary.symsSeen,
+      symsMerged: summary.symsMerged,
+      symsOutsideProject: summary.symsOutsideProject,
+      symsNotMatched: summary.symsNotMatched,
+      unitsSeen: summary.unitsSeen,
+      unitsMerged: summary.unitsMerged,
+      unitFilesSeen: summary.unitFilesSeen,
+      unitFilesMerged: summary.unitFilesMerged,
+      ownershipRowsMerged: summary.ownershipRowsMerged,
+      relsSeen: summary.relsSeen,
+      relsMerged: summary.relsMerged,
+      relsSkipped: summary.relsSkipped,
+      relsAlreadyPresent: summary.relsAlreadyPresent,
+      refsSeen: summary.refsSeen,
+      refsMerged: summary.refsMerged,
+      refsOutsideProject: summary.refsOutsideProject,
+      refsNoSource: summary.refsNoSource,
+      refsNoTarget: summary.refsNoTarget,
+      refsAlreadyPresent: summary.refsAlreadyPresent,
+      refsNonCall: summary.refsNonCall,
+    });
     markSemanticObjcFresh(db);
     db.exec('COMMIT');
   } catch (err) {

@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { DatabaseConnection } from '../src/db';
 import { isSemanticObjcGraphIdle, resolveSemanticObjcStorePathForProject } from '../src/mcp';
+import { MCPEngine } from '../src/mcp/engine';
 import { ToolHandler } from '../src/mcp/tools';
 import { CodeGraph } from '../src';
 import {
@@ -218,6 +219,8 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
       const text = result.content[0]?.text ?? '';
       expect(text).toContain('**Semantic ObjC:** stale');
       expect(text).toContain('**Semantic ObjC stale reason:** test-stale');
+      expect(text).toContain('**Semantic ObjC coverage:**');
+      expect(text).toContain('**Semantic ObjC units:**');
     } finally {
       handler.closeAll();
       cg.close();
@@ -392,6 +395,25 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
       clearInterval(churn);
       watcher.stop();
       vi.useRealTimers();
+    }
+  });
+
+  it('persists failed semantic ObjC watcher state', () => {
+    const cg = CodeGraph.initSync(tempDir);
+    const engine = new MCPEngine({ watch: false });
+    try {
+      (engine as unknown as {
+        persistSemanticObjcWatchState(cg: CodeGraph, status: 'failed', reason?: string): void;
+      }).persistSemanticObjcWatchState(cg, 'failed', 'semantic-watch-boom');
+
+      expect(cg.getSemanticObjcState()).toMatchObject({
+        status: 'failed',
+        reason: 'semantic-watch-boom',
+      });
+      expect(cg.getSemanticObjcState().lastFailureAt).toEqual(expect.any(Number));
+    } finally {
+      engine.stop();
+      cg.close();
     }
   });
 

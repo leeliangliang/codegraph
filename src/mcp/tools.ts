@@ -2759,6 +2759,21 @@ export class ToolHandler {
     if (semanticObjc.staleReason) {
       lines.push(`**Semantic ObjC stale reason:** ${semanticObjc.staleReason}`);
     }
+    if (semanticObjc.coverage) {
+      lines.push(
+        `**Semantic ObjC coverage:** ${semanticObjc.coverage.nodesWithUsr} nodes with USR, ` +
+        `${semanticObjc.coverage.semanticEdges} semantic edges`
+      );
+      lines.push(
+        `**Semantic ObjC units:** ${semanticObjc.coverage.units} units, ` +
+        `${semanticObjc.coverage.unitFiles} unit files, ${semanticObjc.coverage.ownershipRows} ownership rows`
+      );
+    }
+    if (semanticObjc.diagnostics?.length) {
+      for (const diagnostic of semanticObjc.diagnostics) {
+        lines.push(`**Semantic ObjC ${diagnostic.severity}:** ${diagnostic.message}`);
+      }
+    }
 
     lines.push('', '### Nodes by Kind:');
 

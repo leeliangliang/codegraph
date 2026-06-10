@@ -96,6 +96,10 @@ export interface XcRelRecord {
   kind: 'override' | 'base' | 'extended' | 'accessor' | 'receivedBy' | 'ibType' | 'specialization';
   parent: string;
   child: string;
+  /** Occurrence location for callsite-specific relations such as `receivedBy`. */
+  file?: string;
+  line?: number;
+  col?: number;
 }
 
 /**

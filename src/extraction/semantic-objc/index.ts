@@ -42,11 +42,14 @@ export type { SemanticObjcIndexStoreWatcherOptions } from './watch';
 export { applySemanticObjcDeltaRewrite } from './rewrite';
 export type { SemanticObjcRewriteSummary } from './rewrite';
 export {
+  getSemanticObjcCoverage,
+  getSemanticObjcDiagnostics,
   getSemanticObjcState,
   getSemanticObjcStateValue,
   isRetryableSemanticObjcLockError,
   markSemanticObjcFailed,
   markSemanticObjcFresh,
+  markSemanticObjcMergeCompleted,
   markSemanticObjcQueued,
   markSemanticObjcReconciling,
   markSemanticObjcRunning,
@@ -54,7 +57,13 @@ export {
   setSemanticObjcStateValue,
   updateSemanticObjcState,
 } from './state';
-export type { SemanticObjcStateSnapshot, SemanticObjcStatus } from './state';
+export type {
+  SemanticObjcCoverageSnapshot,
+  SemanticObjcDiagnostic,
+  SemanticObjcMergeSummarySnapshot,
+  SemanticObjcStateSnapshot,
+  SemanticObjcStatus,
+} from './state';
 
 export { mergeFromHelper, canonicaliseSymPath } from './merger';
 export type { MergeOptions, MergeSummary } from './merger';

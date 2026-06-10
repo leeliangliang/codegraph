@@ -22,6 +22,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Objective-C and Swift dynamic dispatch now uses the compiler's call-site receiver information when available, so a call like `[faceTask initTask]` links to that receiver's implementation instead of fanning out to every unrelated override with the same selector.
 - The background file watcher no longer exhausts your machine's file-descriptor budget. On macOS it previously kept **one open file handle per watched file**, so on a large project the running MCP server could pile up tens of thousands of handles and blow past the system-wide limit — at which point *unrelated* apps (your shell, editor, Docker, browser) started failing with "too many open files" until the codegraph process was killed. The watcher now uses a single recursive watch on macOS and Windows, and bounded per-directory watches on Linux, so its cost stays flat no matter how large the project is. (#644, #496, #555, #628, #579)
 - Indexing a project with very symbol-dense files (tens of thousands of functions or methods in a single file) no longer runs out of memory. The step that links dynamic call relationships used to load every function and method into memory at once, which could exhaust the heap and abort indexing with "JavaScript heap out of memory" on large or generated codebases; it now streams them, so memory stays flat no matter how many symbols the project has. (#610)
 - Indexing a very large repository no longer aborts during its first sync with a "too many SQL variables" error. (#540)

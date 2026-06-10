@@ -630,6 +630,10 @@ export class CodeGraph {
     markSemanticObjcRunning(this.db.getDb(), reason);
   }
 
+  markSemanticObjcFailed(reason: string): void {
+    markSemanticObjcFailed(this.db.getDb(), reason);
+  }
+
   async enrichSemanticObjc(options: Partial<Omit<EnrichOptions, 'projectRoot'>> = {}): Promise<MergeSummary> {
     try {
       return await this.fileLock.withLockAsync(() => this.enrichSemanticObjcWithGraphLockHeld(options));

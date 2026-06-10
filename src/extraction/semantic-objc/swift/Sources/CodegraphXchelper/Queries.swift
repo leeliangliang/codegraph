@@ -24,9 +24,9 @@ struct Queries {
     /// Emit the full store as NDJSON on stdout. Returns (symbols, refs, rels) counts.
     ///
     /// Two-phase to avoid LMDB `MDB_BAD_RSLOT` from nested read transactions:
-    ///   Phase 1 — collect every symbol name into an array. The `forEachSymbolName`
-    ///             callback does nothing but append; no nested DB calls.
-    ///   Phase 2 — outside any callback, walk the array and run the heavy queries.
+    ///   Phase 1 — collect every symbol name; no nested DB calls.
+    ///   Phase 2 — outside the name callback, stream canonical occurrences and
+    ///             per-USR occurrences without materializing whole result arrays.
     func dumpAll() throws -> (symbols: Int, refs: Int, rels: Int) {
         emitMeta()
         emitCap()
@@ -48,8 +48,13 @@ struct Queries {
         var indexedFiles = Set<String>()
 
         for name in names {
-            let canonicals = db.canonicalOccurrences(ofName: name)
-            for occ in canonicals {
+            var canonicalOccurrencesForName: [SymbolOccurrence] = []
+            db.forEachCanonicalSymbolOccurrence(byName: name) { occ in
+                canonicalOccurrencesForName.append(occ)
+                return true
+            }
+
+            for occ in canonicalOccurrencesForName {
                 if !languageMatches(occ.symbol.language) { continue }
                 if !includeSystem && occ.location.isSystem { continue }
 
@@ -61,11 +66,10 @@ struct Queries {
                 emitSym(occ)
                 symCount += 1
 
-                // Collect refs + rels for this USR via `occurrences(ofUSR:roles:)`,
-                // which returns an array — no nested callback, LMDB-safe.
-                let refs = db.occurrences(ofUSR: usr, roles: .all)
-                for ref in refs {
-                    if !includeSystem && ref.location.isSystem { continue }
+                // Stream refs + rels for this USR. This callback does not issue
+                // nested IndexStoreDB queries, so it remains LMDB-safe.
+                db.forEachSymbolOccurrence(byUSR: usr, roles: .all) { ref in
+                    if !includeSystem && ref.location.isSystem { return true }
                     indexedFiles.insert(ref.location.path)
                     let isDecl = ref.roles.contains(.declaration)
                     let isDef = ref.roles.contains(.definition)
@@ -86,10 +90,11 @@ struct Queries {
                     }
                     for rel in ref.relations {
                         if let kind = relationKind(rel.roles) {
-                            emitRel(kind: kind, parent: rel.symbol.usr, child: usr)
+                            emitRel(kind: kind, parent: rel.symbol.usr, child: usr, occurrence: ref)
                             relCount += 1
                         }
                     }
+                    return true
                 }
             }
         }
@@ -162,7 +167,7 @@ struct Queries {
         write([
             "t": "cap",
             "semanticDeltaVersion": 1,
-            "helperVersion": "codegraph-xchelper 1.1.0",
+            "helperVersion": "codegraph-xchelper 1.1.1",
             "unitFingerprintAlgorithm": "index-unit-v1",
             "recordKinds": ["unit", "unit_file", "sym", "rel", "ref", "inc", "dcl"],
             "sourceMembership": true,
@@ -172,8 +177,9 @@ struct Queries {
     private func emitUnitMembership(for paths: Set<String>) {
         var unitFiles: [String: Set<String>] = [:]
         for file in paths {
-            for unitName in db.unitNamesContainingFile(path: file) {
+            db.forEachUnitNameContainingFile(path: file) { unitName in
                 unitFiles[unitName, default: []].insert(file)
+                return true
             }
         }
 
@@ -193,12 +199,12 @@ struct Queries {
     /// targets that don't resolve to a project file node). Deduped per unit.
     private func emitIncludes(unitName: String) {
         var seen = Set<String>()
-        for entry in db.includesOfUnit(unitName: unitName) {
+        db.forEachIncludeOfUnit(unitName: unitName) { entry in
             // Both endpoints must be in-project — an `#import` of a system
             // header (Foundation, the SDK) has no project file node to link to.
-            guard isInProject(entry.sourcePath), isInProject(entry.targetPath) else { continue }
+            guard isInProject(entry.sourcePath), isInProject(entry.targetPath) else { return true }
             let key = "\(entry.sourcePath)\u{0}\(entry.targetPath)"
-            if seen.contains(key) { continue }
+            if seen.contains(key) { return true }
             seen.insert(key)
             write([
                 "t": "inc",
@@ -206,6 +212,7 @@ struct Queries {
                 "to": relativize(entry.targetPath),
                 "line": entry.line,
             ])
+            return true
         }
     }
 
@@ -333,12 +340,15 @@ struct Queries {
         ])
     }
 
-    private func emitRel(kind: String, parent: String, child: String) {
+    private func emitRel(kind: String, parent: String, child: String, occurrence: SymbolOccurrence) {
         write([
             "t": "rel",
             "kind": kind,
             "parent": parent,
             "child": child,
+            "file": relativize(occurrence.location.path),
+            "line": occurrence.location.line,
+            "col": occurrence.location.utf8Column,
         ])
     }
 
