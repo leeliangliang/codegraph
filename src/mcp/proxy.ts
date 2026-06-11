@@ -167,6 +167,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
   const pending: string[] = [];            // client lines buffered until the daemon resolves
+  const inflight = new Map<unknown, string>(); // id → request written to the daemon, awaiting its reply
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
   let shuttingDown = false;
@@ -203,9 +204,37 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     }
     // initialize already answered locally; notifications (initialized) need no reply.
   };
+  // Remember a request written to the daemon until its reply comes back, so a
+  // request in flight when the daemon dies gets replayed locally instead of
+  // hanging the client forever. initialize is excluded — the client already
+  // got the local answer; notifications have no id and need no reply.
+  const trackInflight = (line: string): void => {
+    try {
+      const msg = JSON.parse(line) as JsonRpc;
+      if (msg.id !== undefined && msg.method !== undefined && msg.method !== 'initialize') {
+        inflight.set(msg.id, line);
+      }
+    } catch { /* not JSON — nothing to replay */ }
+  };
+  const degradeDaemon = (reason: string): void => {
+    if (shuttingDown || daemonStatus === 'failed') return;
+    daemonStatus = 'failed';
+    daemonSocket = null;
+    process.stderr.write(`[CodeGraph MCP] Shared daemon disconnected (${reason}); serving this session in-process (degraded).\n`);
+    // Replay both queues: requests the daemon swallowed without replying,
+    // then lines still waiting to be written.
+    const orphaned = [...inflight.values()];
+    inflight.clear();
+    for (const line of orphaned) void handleLocally(line);
+    const buffered = pending.splice(0);
+    for (const line of buffered) void handleLocally(line);
+  };
   const routeToDaemon = (line: string): void => {
     if (daemonStatus === 'ready' && daemonSocket) {
-      try { daemonSocket.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* close path */ }
+      try {
+        daemonSocket.write(line.endsWith('\n') ? line : line + '\n');
+        trackInflight(line);
+      } catch { /* close path */ }
     } else if (daemonStatus === 'failed') {
       void handleLocally(line);
     } else {
@@ -263,15 +292,19 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const line = sockBuf.slice(0, idx);
         sockBuf = sockBuf.slice(idx + 1);
         if (!line.trim()) continue;
-        if (clientInitId !== undefined) {
-          try { const m = JSON.parse(line) as JsonRpc; if (m.id === clientInitId && ('result' in m || 'error' in m)) continue; } catch { /* relay */ }
-        }
+        try {
+          const m = JSON.parse(line) as JsonRpc;
+          if (m.id !== undefined && ('result' in m || 'error' in m)) {
+            inflight.delete(m.id);
+            if (clientInitId !== undefined && m.id === clientInitId) continue;
+          }
+        } catch { /* relay verbatim */ }
         writeClient(line);
       }
     });
-    socket.on('close', shutdown);
-    socket.on('error', shutdown);
-    for (const line of pending) { try { socket.write(line + '\n'); } catch { /* ignore */ } }
+    socket.on('close', () => degradeDaemon('socket closed'));
+    socket.on('error', (err) => degradeDaemon(err.message));
+    for (const line of pending) { try { socket.write(line + '\n'); trackInflight(line); } catch { /* ignore */ } }
     pending.length = 0;
   } else if (!shuttingDown) {
     daemonStatus = 'failed';

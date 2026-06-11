@@ -302,5 +302,86 @@ describe('Sync Module', () => {
       expect(result.filesRemoved).toBe(0);
       expect(result.changedFilePaths).toBeUndefined();
     });
+
+    it('should refresh synthesized dynamic-dispatch edges on git fast-path sync', async () => {
+      const componentPath = path.join(testDir, 'src', 'Counter.tsx');
+      fs.writeFileSync(
+        componentPath,
+        `export class Counter {
+  bump() {
+    return 1;
+  }
+
+  render() {
+    return null;
+  }
+}
+`
+      );
+      git('add', '-A');
+      git('commit', '-m', 'add counter');
+      await cg.sync();
+
+      let bump = cg.getNodesByKind('method').find((n) => n.name === 'bump');
+      let render = cg.getNodesByKind('method').find((n) => n.name === 'render');
+      expect(bump).toBeDefined();
+      expect(render).toBeDefined();
+      expect(
+        cg.getOutgoingEdges(bump!.id).some((e) => e.target === render!.id && e.kind === 'calls')
+      ).toBe(false);
+
+      fs.writeFileSync(
+        componentPath,
+        `export class Counter {
+  bump() {
+    this.setState({ count: 1 });
+  }
+
+  render() {
+    return null;
+  }
+}
+`
+      );
+
+      const added = await cg.sync();
+      expect(added.changedFilePaths).toContain('src/Counter.tsx');
+      bump = cg.getNodesByKind('method').find((n) => n.name === 'bump');
+      render = cg.getNodesByKind('method').find((n) => n.name === 'render');
+      expect(
+        cg.getOutgoingEdges(bump!.id).some((e) =>
+          e.target === render!.id &&
+          e.kind === 'calls' &&
+          e.provenance === 'heuristic' &&
+          (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'react-render'
+        )
+      ).toBe(true);
+
+      fs.writeFileSync(
+        componentPath,
+        `export class Counter {
+  bump() {
+    return 2;
+  }
+
+  render() {
+    return null;
+  }
+}
+`
+      );
+
+      await cg.sync();
+      bump = cg.getNodesByKind('method').find((n) => n.name === 'bump');
+      render = cg.getNodesByKind('method').find((n) => n.name === 'render');
+      expect(
+        cg.getOutgoingEdges(bump!.id).some((e) =>
+          e.target === render!.id &&
+          e.kind === 'calls' &&
+          e.provenance === 'heuristic' &&
+          (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'react-render'
+        )
+      ).toBe(false);
+    });
   });
 });

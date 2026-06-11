@@ -540,7 +540,11 @@ export class CodeGraph {
       options
     );
 
-    return this.watcher.start();
+    const started = this.watcher.start();
+    if (!started) {
+      this.watcher = null;
+    }
+    return started;
   }
 
   /**

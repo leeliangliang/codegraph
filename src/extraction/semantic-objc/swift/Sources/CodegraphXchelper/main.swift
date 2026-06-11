@@ -150,7 +150,7 @@ private func collectProjectOutputNames(sourceRootURL: URL, languages: Set<Langua
 
 private func sourceExtensions(for languages: Set<Language>) -> Set<String> {
     if languages.isEmpty {
-        return ["m", "mm", "c", "cc", "cpp", "cxx", "swift"]
+        return primarySourceFileExtensions
     }
 
     var extensions = Set<String>()

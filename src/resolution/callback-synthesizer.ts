@@ -31,6 +31,22 @@ const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|regi
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
 const MAX_CALLBACKS_PER_CHANNEL = 40;
 const EVENT_FANOUT_CAP = 6; // skip events with more handlers/dispatchers than this (too generic without type info)
+const CALLBACK_SYNTHESIZER_NAMES = [
+  'callback',
+  'closure-collection',
+  'event-emitter',
+  'react-render',
+  'flutter-build',
+  'cpp-override',
+  'interface-impl',
+  'go-grpc-stub-impl',
+  'jsx-render',
+  'vue-handler',
+  'rn-event-channel',
+  'fabric-native-impl',
+  'mybatis-java-xml',
+  'gin-middleware-chain',
+] as const;
 
 const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))/g;
 const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
@@ -1228,6 +1244,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     seen.add(key);
     merged.push(e);
   }
+  queries.deleteHeuristicEdgesBySynthesizers(CALLBACK_SYNTHESIZER_NAMES);
   if (merged.length > 0) queries.insertEdges(merged);
   return merged.length;
 }

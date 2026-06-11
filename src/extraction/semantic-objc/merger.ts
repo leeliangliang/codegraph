@@ -478,6 +478,12 @@ export async function mergeFromHelper(
         seenUnits.add(unit.unit_id);
         summary.unitsMerged++;
       }
+      // CONTRACT: the helper emits the FULL current unit set every run — the
+      // delta planner's removedUnitIds detection relies on the same invariant.
+      // A partial dump here would wrongly prune surviving units' rows. This
+      // also means the language set must stay stable across runs for one
+      // project: a dump made with `--language objc` prunes units that were
+      // recorded from an earlier `--language objc swift` run.
       pruneStaleSemanticObjcUnits(db, seenUnits);
       for (const unitId of seenUnits) {
         deleteUnitFilesStmt.run(unitId);

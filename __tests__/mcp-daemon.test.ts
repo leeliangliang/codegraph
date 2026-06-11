@@ -39,6 +39,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { CodeGraphPackageVersion } from '../src/mcp/version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -358,6 +359,112 @@ describe('Shared MCP daemon (issue #411)', () => {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
     }
   }, 30000);
+
+  it('local-handshake proxy falls back in-process when the daemon disconnects mid-session', async () => {
+    const net = await import('net');
+    const sockPath = getDaemonSocketPath(realRoot);
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({ pid: process.pid, version: CodeGraphPackageVersion, socketPath: sockPath, startedAt: Date.now() }),
+    );
+    const miniServer = net.createServer((sock) => {
+      sock.write(JSON.stringify({ codegraph: CodeGraphPackageVersion, pid: 1, socketPath: sockPath, protocol: 1 }) + '\n');
+      setTimeout(() => {
+        sock.end();
+        sock.destroy();
+        miniServer.close();
+      }, 100);
+    });
+    await new Promise<void>((resolve) => miniServer.listen(sockPath, () => resolve()));
+
+    try {
+      const server = spawnServer(tempDir, { CODEGRAPH_PPID_POLL_MS: '200' });
+      servers.push(server);
+
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      const initResp = await waitFor(() => findResponse(server.stdout, 1), 10000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}\ndaemon.log:\n${readDaemonLog(realRoot)}`);
+      });
+      expect(initResp.result.serverInfo.name).toBe('codegraph');
+      await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 12000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nwaiting for attach\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+      await waitFor(() => server.stderr.some((l) => l.includes('Shared daemon disconnected')), 10000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nwaiting for disconnect\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+
+      sendMessage(server.child, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'codegraph_status', arguments: {} },
+      });
+
+      const statusResp = await waitFor(() => findResponse(server.stdout, 2), 10000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nwaiting for local status\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+      expect(statusResp.result.content[0].text).toContain('CodeGraph Status');
+      expect(server.child.exitCode).toBeNull();
+    } finally {
+      if (miniServer.listening) {
+        await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+      }
+    }
+  }, 40000);
+
+  it('local-handshake proxy replays an in-flight request locally when the daemon dies before replying', async () => {
+    const net = await import('net');
+    const sockPath = getDaemonSocketPath(realRoot);
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({ pid: process.pid, version: CodeGraphPackageVersion, socketPath: sockPath, startedAt: Date.now() }),
+    );
+    // A daemon that swallows the request: accepts the attach, then kills the
+    // connection the moment a tools/call arrives — WITHOUT replying. The
+    // request is now in flight; the proxy must replay it in-process instead
+    // of leaving the client hanging.
+    const miniServer = net.createServer((sock) => {
+      sock.write(JSON.stringify({ codegraph: CodeGraphPackageVersion, pid: 1, socketPath: sockPath, protocol: 1 }) + '\n');
+      sock.on('data', (chunk: Buffer) => {
+        if (chunk.toString('utf8').includes('"tools/call"')) {
+          sock.destroy();
+          miniServer.close();
+        }
+      });
+    });
+    await new Promise<void>((resolve) => miniServer.listen(sockPath, () => resolve()));
+
+    try {
+      const server = spawnServer(tempDir, { CODEGRAPH_PPID_POLL_MS: '200' });
+      servers.push(server);
+
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      await waitFor(() => findResponse(server.stdout, 1), 10000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+      await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 12000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nwaiting for attach\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+
+      sendMessage(server.child, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'codegraph_status', arguments: {} },
+      });
+
+      const statusResp = await waitFor(() => findResponse(server.stdout, 2), 15000).catch((e) => {
+        throw new Error(`${(e as Error).message}\nwaiting for replayed in-flight response\nstdout:\n${server.stdout.join('\n')}\nstderr:\n${server.stderr.join('\n')}`);
+      });
+      expect(statusResp.result.content[0].text).toContain('CodeGraph Status');
+      expect(server.stderr.some((l) => l.includes('Shared daemon disconnected'))).toBe(true);
+      expect(server.child.exitCode).toBeNull();
+    } finally {
+      if (miniServer.listening) {
+        await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+      }
+    }
+  }, 40000);
 
   it('daemon idle-times-out after the last client disconnects', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '800', CODEGRAPH_PPID_POLL_MS: '200' };

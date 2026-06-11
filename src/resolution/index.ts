@@ -656,14 +656,31 @@ export class ReferenceResolver {
    * Create edges from resolved references
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
+    // Batch-load every node consulted for the kind promotions below. A
+    // per-ref getNodeById here was the last N+1 on the resolution hot path:
+    // the node LRU caps at 1000, far below a big repo's working set, so each
+    // promotion candidate was a near-guaranteed single-row query (painful on
+    // the wasm backend).
+    const lookupIds = new Set<string>();
+    for (const ref of resolved) {
+      const kind = ref.original.referenceKind;
+      if (kind === 'extends') {
+        lookupIds.add(ref.targetNodeId);
+        lookupIds.add(ref.original.fromNodeId);
+      } else if (kind === 'calls') {
+        lookupIds.add(ref.targetNodeId);
+      }
+    }
+    const nodesById = this.queries.getNodesByIds([...lookupIds]);
+
     return resolved.map((ref) => {
       let kind = ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
-        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        const targetNode = nodesById.get(ref.targetNodeId);
         if (targetNode && (targetNode.kind === 'interface' || targetNode.kind === 'protocol')) {
-          const sourceNode = this.queries.getNodeById(ref.original.fromNodeId);
+          const sourceNode = nodesById.get(ref.original.fromNodeId);
           if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
             kind = 'implements';
           }
@@ -676,7 +693,7 @@ export class ReferenceResolver {
       // apart from a function call without symbol info, but resolution
       // can: if `Foo` resolves to a class, the call IS an instantiation.
       if (kind === 'calls') {
-        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        const targetNode = nodesById.get(ref.targetNodeId);
         if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
           kind = 'instantiates';
         }
@@ -723,6 +740,13 @@ export class ReferenceResolver {
         }))
       );
     }
+
+    // Runs on the sync fast-path too, not just full index: the synthesizers
+    // are whole-graph (delete-all-then-reinsert), so a sync that skipped this
+    // would leave stale heuristic edges behind after an edit. Rebuilding them
+    // on every sync is O(graph) — the accepted cost of stale-edge correctness;
+    // don't "optimize" it away without an incremental synthesizer design.
+    this.synthesizeDynamicEdges(result.stats.byMethod);
 
     return result;
   }
@@ -804,21 +828,25 @@ export class ReferenceResolver {
       }
     }
 
-    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
-    // synthesize observer/callback dispatch edges (dispatcher → registered
-    // callbacks) that static parsing leaves out. Best-effort — never fail the
-    // index on it. See docs/design/callback-edge-synthesis.md.
-    try {
-      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
-    } catch {
-      // synthesis is additive and optional; ignore failures
-    }
+    this.synthesizeDynamicEdges(aggregateStats.byMethod);
 
     return {
       resolved: [],
       unresolved: [],
       stats: aggregateStats,
     };
+  }
+
+  private synthesizeDynamicEdges(stats: Record<string, number>): void {
+    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
+    // synthesize observer/callback dispatch edges (dispatcher → registered
+    // callbacks) that static parsing leaves out. Best-effort — never fail the
+    // index on it. See docs/design/callback-edge-synthesis.md.
+    try {
+      stats['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
   }
 
   /**

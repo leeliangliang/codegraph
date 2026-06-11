@@ -74,10 +74,10 @@ codegraph install
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
-<sub>`codegraph init` just creates the local `.codegraph/` index directory; adding `-i` (`--index`) also builds the initial graph in the same step. Without `-i`, run `codegraph index` afterwards to populate it.</sub>
+<sub>`codegraph init` creates the local `.codegraph/` directory and builds the initial graph. The legacy `-i` / `--index` flag is still accepted for old scripts, but it is no longer required.</sub>
 
 <div align="center">
 
@@ -353,7 +353,7 @@ Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent /
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
 Builds the per-project knowledge graph index. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
@@ -418,7 +418,7 @@ CodeGraph's MCP server delivers its usage guidance to your agent **automatically
 - **Answer structural questions directly with CodeGraph** — it *is* the pre-built index, so a grep/read loop just repeats work it already did. Treat the returned source as already read.
 - **Pick the tool by intent:** `codegraph_explore` for almost anything — "how does X work", a flow/"how does X reach Y", or surveying an area (one call returns the relevant symbols' source grouped by file); `codegraph_search` to just locate a symbol; `codegraph_callers`/`codegraph_callees` to walk call flow; `codegraph_impact` before editing; `codegraph_node` for one specific symbol's full source (it returns every overload for an ambiguous name).
 - **Trust the results — don't re-verify with grep**, and check the staleness banner after edits.
-- If `.codegraph/` doesn't exist yet, offer to run `codegraph init -i`.
+- If `.codegraph/` doesn't exist yet, offer to run `codegraph init`.
 
 The exact text is `src/mcp/server-instructions.ts` — the single source of truth.
 
@@ -465,10 +465,10 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
-codegraph init [path]             # Initialize in a project (--index to also index)
+codegraph init [path]             # Initialize and build the initial project index
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
-codegraph sync [path]             # Incremental update
+codegraph sync [path]             # Incremental source update (--with-semantic-objc for manual semantic refresh)
 codegraph status [path]           # Show statistics
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
@@ -720,11 +720,11 @@ If the agent launches MCP servers from the wrong working directory, pass an expl
 
 ```bash
 cd /path/to/project
-codegraph init -i
+codegraph init
 codegraph status
 ```
 
-`init -i` creates `.codegraph/`, builds the initial SQLite graph, and makes the MCP tools available to configured agents. After initialization, the MCP server's watcher keeps the graph updated on source-file changes.
+`init` creates `.codegraph/`, builds the initial SQLite graph, and makes the MCP tools available to configured agents. After initialization, the MCP server's watcher keeps the graph updated on source-file changes.
 
 ### Deploy Semantic ObjC / Swift Enrichment
 
@@ -746,7 +746,7 @@ In the target Xcode project:
 xcodebuild -workspace YourApp.xcworkspace -scheme YourScheme build
 
 # 2. Initialize and index CodeGraph
-codegraph init -i /path/to/project
+codegraph init /path/to/project
 
 # 3. Run semantic enrichment
 codegraph enrich-objc /path/to/project --language objc swift
@@ -780,7 +780,14 @@ For MCP auto-refresh of Xcode IndexStore changes:
 }
 ```
 
-The semantic watcher waits for IndexStore quiescence, serializes writes through the same graph lock as normal indexing, and reports `fresh`, `stale`, `queued`, `running`, `failed`, or `reconciling` through status.
+This MCP config starts the Semantic ObjC IndexStore watcher inside the MCP process. You do not need to run `codegraph init --with-semantic-objc` for that watcher to start. The watcher waits for IndexStore quiescence, serializes writes through the same graph lock as normal indexing, and reports `fresh`, `stale`, `queued`, `running`, `failed`, or `reconciling` through status.
+
+Important behavior:
+
+- `codegraph init` builds the normal tree-sitter graph only.
+- `codegraph init --with-semantic-objc`, `codegraph index --with-semantic-objc`, and `codegraph sync --with-semantic-objc` are one-shot manual semantic runs.
+- `codegraph serve --mcp --semantic-objc-config '{"enabled":true,"watchIndexStore":true}'` is the long-running automatic path. It watches the Xcode IndexStore and refreshes semantic data after Xcode writes new units.
+- If Semantic ObjC has never run, `codegraph_status` shows `Semantic ObjC: not-run` until a manual semantic run completes or the MCP watcher observes an IndexStore change and finishes its first job.
 
 ### Release Deployment
 
@@ -852,12 +859,23 @@ codegraph index --force /path/to/project
 
 ### Operate Semantic ObjC / Swift Enrichment
 
-Typical flow after source edits and an Xcode build:
+If your MCP server is configured with `--semantic-objc-config '{"enabled":true,"watchIndexStore":true}'`, the preferred flow is to let MCP do the semantic refresh:
+
+```bash
+xcodebuild -workspace YourApp.xcworkspace -scheme YourScheme build
+codegraph status /path/to/project
+```
+
+The MCP watcher observes the Xcode IndexStore, waits for it to become stable, and refreshes semantic data when the graph is idle. Use `codegraph status` or `codegraph_status` to confirm whether semantic data is `queued`, `running`, `fresh`, or `stale`.
+
+Manual recovery flow after source edits and an Xcode build:
 
 ```bash
 xcodebuild -workspace YourApp.xcworkspace -scheme YourScheme build
 codegraph sync --with-semantic-objc /path/to/project
 ```
+
+`sync --with-semantic-objc` first syncs source-file changes, then runs the semantic layer once. Keep it for recovery, CI-style refreshes, or sessions where no MCP semantic watcher is running.
 
 Or run only the semantic layer:
 
@@ -904,6 +922,8 @@ codegraph serve --mcp --path /path/to/project \
   --semantic-objc-config '{"enabled":true,"watchIndexStore":true}'
 ```
 
+This is an MCP server option, not an indexing option. It tells the current MCP process or shared daemon to start the Semantic ObjC watcher after the normal graph opens. The normal file watcher still handles source changes; the Semantic ObjC watcher handles Xcode IndexStore changes.
+
 Useful checks:
 
 ```bash
@@ -912,7 +932,7 @@ codegraph files /path/to/project --max-depth 2
 codegraph query "SomeSymbol" /path/to/project
 ```
 
-If an MCP client reports that no CodeGraph project is loaded, add `--path /absolute/path/to/project` to the MCP server args or initialize the project with `codegraph init -i`.
+If an MCP client reports that no CodeGraph project is loaded, add `--path /absolute/path/to/project` to the MCP server args or initialize the project with `codegraph init`.
 
 ### Upgrade / Rollback
 

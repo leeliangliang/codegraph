@@ -108,6 +108,16 @@ describe('FileWatcher', () => {
 
       expect(watcher.isActive()).toBe(false);
     });
+
+    it('CodeGraph does not retain a watcher after start failure', async () => {
+      const cg = CodeGraph.initSync(testDir);
+      fs.rmSync(testDir, { recursive: true, force: true });
+
+      expect(cg.watch()).toBe(false);
+      await expect(cg.waitUntilWatcherReady(50)).resolves.toBeUndefined();
+
+      cg.destroy();
+    });
   });
 
   describe('debounced sync', () => {

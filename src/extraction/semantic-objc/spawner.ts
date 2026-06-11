@@ -101,7 +101,12 @@ export async function discoverIndexStorePath(helperPath: string, sourceRoot: str
   child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk.toString('utf8')));
 
   await new Promise<void>((resolve, reject) => {
-    child.once('error', (err) => reject(err));
+    child.once('error', (err) => {
+      // 'error' usually means the spawn itself failed, but if the process did
+      // start, don't leak it past the rejection.
+      if (!child.killed) child.kill('SIGTERM');
+      reject(err);
+    });
     child.once('close', (code) => {
       if (code === 0) {
         resolve();
@@ -169,10 +174,20 @@ export function spawnHelper(opts: SpawnerOptions): SpawnerHandle {
   async function* iterate(): AsyncIterable<XcRecord> {
     if (!child.stdout) return;
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line) continue;
-      const parsed = parseNdjsonLine(line);
-      if (parsed) yield parsed;
+    let drained = false;
+    try {
+      for await (const line of rl) {
+        if (!line) continue;
+        const parsed = parseNdjsonLine(line);
+        if (parsed) yield parsed;
+      }
+      drained = true;
+    } finally {
+      // A consumer that breaks out early closes the generator here — reap the
+      // helper instead of leaving it writing into a dead pipe. (Skipped after
+      // a full drain: stdout EOF means the helper is exiting on its own, and a
+      // late SIGTERM could turn its clean exit into a wait() rejection.)
+      if (!drained && !child.killed) child.kill('SIGTERM');
     }
   }
 

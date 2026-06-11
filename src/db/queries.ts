@@ -188,6 +188,7 @@ export class QueryBuilder {
     getNodesByFile?: SqliteStatement;
     getNodesByKind?: SqliteStatement;
     insertEdge?: SqliteStatement;
+    deleteHeuristicEdgesBySynthesizers?: SqliteStatement;
     upsertFile?: SqliteStatement;
     deleteEdgesBySource?: SqliteStatement;
     deleteEdgesByTarget?: SqliteStatement;
@@ -1283,6 +1284,22 @@ export class QueryBuilder {
       this.stmts.deleteEdgesBySource = this.db.prepare('DELETE FROM edges WHERE source = ?');
     }
     this.stmts.deleteEdgesBySource.run(sourceId);
+  }
+
+  /**
+   * Delete heuristic edges owned by dynamic-dispatch synthesizers before a
+   * refresh. Other heuristic producers, such as semantic ObjC enrichment, keep
+   * their edges because they are not rebuilt by callback synthesis.
+   */
+  deleteHeuristicEdgesBySynthesizers(synthesizers: readonly string[]): void {
+    if (synthesizers.length === 0) return;
+
+    const placeholders = synthesizers.map(() => '?').join(',');
+    this.db.prepare(`
+      DELETE FROM edges
+      WHERE provenance = 'heuristic'
+        AND json_extract(metadata, '$.synthesizedBy') IN (${placeholders})
+    `).run(...synthesizers);
   }
 
   /**

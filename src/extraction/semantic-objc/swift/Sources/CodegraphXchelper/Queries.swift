@@ -15,6 +15,12 @@
 import Foundation
 import IndexStoreDB
 
+/// Extensions of compilable (primary) translation-unit sources. Single source
+/// of truth shared with `sourceExtensions(for:)` in main.swift — a file the
+/// dump indexes but this set misses loses its file→unit membership in
+/// `emitUnitMembership` and is misclassified as `"header"` by `unitFileRole`.
+let primarySourceFileExtensions: Set<String> = ["m", "mm", "c", "cc", "cpp", "cxx", "swift"]
+
 struct Queries {
     let db: IndexStoreDB
     let sourceRoot: String
@@ -48,53 +54,58 @@ struct Queries {
         var indexedFiles = Set<String>()
 
         for name in names {
-            var canonicalOccurrencesForName: [SymbolOccurrence] = []
-            db.forEachCanonicalSymbolOccurrence(byName: name) { occ in
-                canonicalOccurrencesForName.append(occ)
-                return true
-            }
-
-            for occ in canonicalOccurrencesForName {
-                if !languageMatches(occ.symbol.language) { continue }
-                if !includeSystem && occ.location.isSystem { continue }
-
-                let usr = occ.symbol.usr
-                if seenUSRs.contains(usr) { continue }
-                seenUSRs.insert(usr)
-
-                indexedFiles.insert(occ.location.path)
-                emitSym(occ)
-                symCount += 1
-
-                // Stream refs + rels for this USR. This callback does not issue
-                // nested IndexStoreDB queries, so it remains LMDB-safe.
-                db.forEachSymbolOccurrence(byUSR: usr, roles: .all) { ref in
-                    if !includeSystem && ref.location.isSystem { return true }
-                    indexedFiles.insert(ref.location.path)
-                    let isDecl = ref.roles.contains(.declaration)
-                    let isDef = ref.roles.contains(.definition)
-                    let isDeclOrDef = isDecl || isDef
-                    // A forward declaration at a different site than the
-                    // canonical (definition) occurrence — e.g. the `.h`
-                    // `@interface` method vs the `.m` `@implementation`. Emit a
-                    // `dcl` record so the Node side can link decl → def.
-                    if isDecl && !isDef
-                        && !(ref.location.path == occ.location.path && ref.location.line == occ.location.line) {
-                        emitDecl(ref, defUSR: usr)
-                    }
-                    if !isDeclOrDef && (ref.roles.contains(.reference) || ref.roles.contains(.call)
-                        || ref.roles.contains(.read) || ref.roles.contains(.write)
-                        || ref.roles.contains(.addressOf)) {
-                        emitRef(ref, calleeUSR: usr)
-                        refCount += 1
-                    }
-                    for rel in ref.relations {
-                        if let kind = relationKind(rel.roles) {
-                            emitRel(kind: kind, parent: rel.symbol.usr, child: usr, occurrence: ref)
-                            relCount += 1
-                        }
-                    }
+            // Drain per-name: occurrence iteration bridges ObjC/CF temporaries
+            // (paths, USR strings) that otherwise pile up in the never-drained
+            // top-level pool across hundreds of thousands of names.
+            autoreleasepool {
+                var canonicalOccurrencesForName: [SymbolOccurrence] = []
+                db.forEachCanonicalSymbolOccurrence(byName: name) { occ in
+                    canonicalOccurrencesForName.append(occ)
                     return true
+                }
+
+                for occ in canonicalOccurrencesForName {
+                    if !languageMatches(occ.symbol.language) { continue }
+                    if !includeSystem && occ.location.isSystem { continue }
+
+                    let usr = occ.symbol.usr
+                    if seenUSRs.contains(usr) { continue }
+                    seenUSRs.insert(usr)
+
+                    indexedFiles.insert(occ.location.path)
+                    emitSym(occ)
+                    symCount += 1
+
+                    // Stream refs + rels for this USR. This callback does not issue
+                    // nested IndexStoreDB queries, so it remains LMDB-safe.
+                    db.forEachSymbolOccurrence(byUSR: usr, roles: .all) { ref in
+                        if !includeSystem && ref.location.isSystem { return true }
+                        indexedFiles.insert(ref.location.path)
+                        let isDecl = ref.roles.contains(.declaration)
+                        let isDef = ref.roles.contains(.definition)
+                        let isDeclOrDef = isDecl || isDef
+                        // A forward declaration at a different site than the
+                        // canonical (definition) occurrence — e.g. the `.h`
+                        // `@interface` method vs the `.m` `@implementation`. Emit a
+                        // `dcl` record so the Node side can link decl → def.
+                        if isDecl && !isDef
+                            && !(ref.location.path == occ.location.path && ref.location.line == occ.location.line) {
+                            emitDecl(ref, defUSR: usr)
+                        }
+                        if !isDeclOrDef && (ref.roles.contains(.reference) || ref.roles.contains(.call)
+                            || ref.roles.contains(.read) || ref.roles.contains(.write)
+                            || ref.roles.contains(.addressOf)) {
+                            emitRef(ref, calleeUSR: usr)
+                            refCount += 1
+                        }
+                        for rel in ref.relations {
+                            if let kind = relationKind(rel.roles) {
+                                emitRel(kind: kind, parent: rel.symbol.usr, child: usr, occurrence: ref)
+                                relCount += 1
+                            }
+                        }
+                        return true
+                    }
                 }
             }
         }
@@ -189,12 +200,16 @@ struct Queries {
         }
 
         for unitName in unitFiles.keys.sorted() {
-            let files = Array(unitFiles[unitName] ?? []).sorted()
-            emitUnit(unitName: unitName, files: files)
-            for file in files {
-                emitUnitFile(unitName: unitName, file: file)
+            // Per-unit drain: fingerprinting stats every member file via
+            // FileManager (one autoreleased attribute dictionary per file).
+            autoreleasepool {
+                let files = Array(unitFiles[unitName] ?? []).sorted()
+                emitUnit(unitName: unitName, files: files)
+                for file in files {
+                    emitUnitFile(unitName: unitName, file: file)
+                }
+                emitIncludes(unitName: unitName)
             }
-            emitIncludes(unitName: unitName)
         }
     }
 
@@ -262,8 +277,8 @@ struct Queries {
     }
 
     private func isPrimarySourceFile(_ file: String) -> Bool {
-        let lower = file.lowercased()
-        return lower.hasSuffix(".m") || lower.hasSuffix(".mm") || lower.hasSuffix(".swift")
+        let ext = (file as NSString).pathExtension.lowercased()
+        return primarySourceFileExtensions.contains(ext)
     }
 
     private func fingerprint(unitName: String, files: [String]) -> String {
@@ -367,9 +382,16 @@ struct Queries {
     }
 
     private func write(_ obj: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes]) else { return }
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data([0x0a])) // newline
+        // JSONSerialization autoreleases a page-rounded (4 KB) NSData per call.
+        // This runs once per emitted NDJSON line — millions of times on a large
+        // store — and the top-level pool only drains at process exit, so without
+        // a local pool the dump's footprint grows ~4 KB per line unbounded
+        // (observed: 2.87 M lines → 12 GB of NSConcreteData/_NSJSONWriter).
+        autoreleasepool {
+            guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes]) else { return }
+            FileHandle.standardOutput.write(data)
+            FileHandle.standardOutput.write(Data([0x0a])) // newline
+        }
     }
 
     // MARK: - Enum stringification
