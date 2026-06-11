@@ -137,6 +137,7 @@ export async function enrichWithIndexStore(
 }
 
 export function inferSemanticObjcSourceRoot(projectRoot: string, source?: QueryBuilder | FileRecord[]): string {
+  if (containsXcodeWorkspace(projectRoot)) return projectRoot;
   if (!source) return projectRoot;
 
   const files = Array.isArray(source) ? source : source.getAllFiles();

@@ -74,6 +74,23 @@ describe('semantic-objc helper discovery', () => {
 });
 
 describe('semantic-objc source root inference', () => {
+  it('prefers the indexed project root when it already contains an Xcode workspace', () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-semobjc-root-'));
+    try {
+      fs.mkdirSync(path.join(projectRoot, 'mvbox.xcworkspace'), { recursive: true });
+      fs.mkdirSync(path.join(projectRoot, 'MvBox/MvBox.xcodeproj'), { recursive: true });
+      const files = [
+        { path: 'MvBox/Sources/MyVC.m' },
+        { path: 'MvBox/Sources/MyVC.h' },
+        { path: 'Pods/Firebase/FIRApp.m' },
+      ] as FileRecord[];
+
+      expect(inferSemanticObjcSourceRoot(projectRoot, files)).toBe(projectRoot);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it('uses an indexed Xcode workspace subdirectory instead of the repository parent', () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-semobjc-root-'));
     try {
@@ -260,6 +277,48 @@ describe('semantic-objc mergeFromHelper — delta metadata persistence', () => {
       unitFiles: 1,
       ownershipRows: 1,
     });
+  });
+
+  it('removes stale unit metadata that is absent from a successful full helper dump', async () => {
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_units
+        (unit_id, fingerprint, fingerprint_algo, helper_version, last_seen_at, status)
+      VALUES
+        ('old-unit', 'old-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh'),
+        ('unit-1', 'old-unit-1-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh')
+    `).run();
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_unit_files (unit_id, file_path, role)
+      VALUES
+        ('old-unit', 'Old.h', 'header'),
+        ('unit-1', 'Sources/OldHeader.h', 'header')
+    `).run();
+
+    const handle = recordSourceHandle(synth([
+      {
+        t: 'cap',
+        semanticDeltaVersion: 1,
+        helperVersion: 'helper-v2',
+        unitFingerprintAlgorithm: 'index-unit-v1',
+        recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+        sourceMembership: true,
+      },
+      { t: 'unit', unit_id: 'unit-1', fingerprint: 'fp-1', main_file: 'Sources/MyVC.m' },
+      { t: 'unit_file', unit_id: 'unit-1', file: 'Sources/MyVC.m', role: 'primary' },
+      { t: 'done', symbols: 0, refs: 0, rels: 0 },
+    ]));
+
+    await mergeFromHelper(conn.getDb(), handle, {
+      projectRoot: '/proj',
+      helperSourceRoot: '/proj',
+    });
+
+    expect(conn.getDb().prepare('SELECT unit_id FROM semantic_objc_units ORDER BY unit_id').all()).toEqual([
+      { unit_id: 'unit-1' },
+    ]);
+    expect(conn.getDb().prepare('SELECT unit_id, file_path, role FROM semantic_objc_unit_files ORDER BY unit_id, file_path').all()).toEqual([
+      { unit_id: 'unit-1', file_path: 'Sources/MyVC.m', role: 'primary' },
+    ]);
   });
 
   it('ignores invalid stored merge summary JSON', () => {
@@ -612,6 +671,13 @@ describe('semantic-objc mergeFromHelper — Phase C (ref → semantic call edges
     }
     const roles = refEdges.map((e) => JSON.parse(e.metadata).role).sort();
     expect(roles).toEqual(['read', 'write']);
+
+    const state = conn.getDb().prepare(
+      "SELECT value FROM semantic_objc_state WHERE key = 'last_merge_summary_json'"
+    ).get() as { value: string };
+    const persisted = JSON.parse(state.value);
+    expect(persisted.refsDataflowMerged).toBe(2);
+    expect(persisted.refsDataflowAlreadyPresent).toBe(0);
   });
 
   it('is idempotent on refs — re-running does not duplicate call edges', async () => {

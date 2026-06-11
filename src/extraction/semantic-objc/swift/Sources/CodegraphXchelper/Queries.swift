@@ -176,7 +176,12 @@ struct Queries {
 
     private func emitUnitMembership(for paths: Set<String>) {
         var unitFiles: [String: Set<String>] = [:]
-        for file in paths {
+        // Header files can be included by hundreds or thousands of translation
+        // units. Reverse-querying every indexed header creates a huge
+        // unit->file fan-out while adding little delta value; primary source
+        // files are enough to track touched units and ownership.
+        let membershipPaths = paths.filter(isPrimarySourceFile)
+        for file in membershipPaths {
             db.forEachUnitNameContainingFile(path: file) { unitName in
                 unitFiles[unitName, default: []].insert(file)
                 return true

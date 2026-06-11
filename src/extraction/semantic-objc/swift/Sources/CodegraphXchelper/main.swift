@@ -10,6 +10,7 @@
 // uses this exit-code as the signal to fall back to tree-sitter-only mode.
 
 import ArgumentParser
+import CodegraphXchelperSupport
 import Foundation
 import IndexStoreDB
 
@@ -69,47 +70,65 @@ struct RuntimeError: LocalizedError {
 /// run. Large DerivedData stores may include old targets, dependencies, and
 /// generated units unrelated to the current project root; importing all of them
 /// expands the transient LMDB map dramatically. `useExplicitOutputUnits` lets us
-/// enqueue only the units whose compiler output paths correspond to source files
-/// in this project.
-func collectExplicitOutputUnitPaths(storeURL: URL, sourceRoot: URL) -> [String] {
-    let fm = FileManager.default
+/// enqueue only the units whose IndexStore-recorded compiler output paths
+/// correspond to source files in this project.
+func collectExplicitOutputUnitPaths(storeURL: URL, libURL: URL, sourceRoot: URL, languages: Set<Language>) throws -> [String] {
     let sourceRootURL = sourceRoot.resolvingSymlinksInPath().standardizedFileURL
-    let desiredOutputNames = collectProjectOutputNames(sourceRootURL: sourceRootURL)
+    let desiredOutputNames = collectProjectOutputNames(sourceRootURL: sourceRootURL, languages: languages)
     if desiredOutputNames.isEmpty { return [] }
 
-    var scanRoots: [URL] = []
-    if let derivedRoot = derivedDataRoot(forStoreURL: storeURL) {
-        scanRoots.append(derivedRoot.appendingPathComponent("Build", isDirectory: true))
+    let collector = OutputPathCollector()
+    let allowedOutputNames = desiredOutputNames.sorted().map { strdup($0) }
+    defer {
+        for ptr in allowedOutputNames {
+            free(ptr)
+        }
     }
-    // Non-Xcode tests and clang/CMake builds often place object files next to
-    // the sources or under an in-project build directory.
-    scanRoots.append(sourceRootURL)
+    let allowedOutputNamePointers = allowedOutputNames.map { UnsafePointer($0) }
+    var errorBuffer = [CChar](repeating: 0, count: 4096)
+    let context = Unmanaged.passUnretained(collector).toOpaque()
 
-    var seen = Set<String>()
-    var out: [String] = []
-    for root in scanRoots {
-        guard fm.fileExists(atPath: root.path) else { continue }
-        guard let enumerator = fm.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { continue }
-
-        for case let url as URL in enumerator {
-            guard desiredOutputNames.contains(url.lastPathComponent) else { continue }
-            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            let path = url.resolvingSymlinksInPath().standardized.path
-            if seen.insert(path).inserted {
-                out.append(path)
+    let status = storeURL.path.withCString { storePath in
+        libURL.path.withCString { libPath in
+            sourceRootURL.path.withCString { sourceRootPath in
+                allowedOutputNamePointers.withUnsafeBufferPointer { allowed in
+                    codegraph_xc_collect_unit_output_paths(
+                        storePath,
+                        libPath,
+                        sourceRootPath,
+                        allowed.baseAddress,
+                        Int32(allowed.count),
+                        collectOutputPath,
+                        context,
+                        &errorBuffer,
+                        Int32(errorBuffer.count)
+                    )
+                }
             }
         }
     }
-    return out.sorted()
+
+    if status != 0 {
+        let message = String(cString: errorBuffer)
+        throw RuntimeError(message.isEmpty ? "failed to collect IndexStore unit output paths" : message)
+    }
+
+    return collector.paths.sorted()
 }
 
-private func collectProjectOutputNames(sourceRootURL: URL) -> Set<String> {
+private final class OutputPathCollector {
+    var paths = Set<String>()
+}
+
+private let collectOutputPath: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { rawPath, rawContext in
+    guard let rawPath, let rawContext else { return }
+    let collector = Unmanaged<OutputPathCollector>.fromOpaque(rawContext).takeUnretainedValue()
+    collector.paths.insert(String(cString: rawPath))
+}
+
+private func collectProjectOutputNames(sourceRootURL: URL, languages: Set<Language>) -> Set<String> {
     let fm = FileManager.default
-    let sourceExts: Set<String> = ["m", "mm", "c", "cc", "cpp", "cxx", "swift"]
+    let sourceExts = sourceExtensions(for: languages)
     var names = Set<String>()
 
     guard let enumerator = fm.enumerator(
@@ -129,13 +148,29 @@ private func collectProjectOutputNames(sourceRootURL: URL) -> Set<String> {
     return names
 }
 
-private func derivedDataRoot(forStoreURL storeURL: URL) -> URL? {
-    let standardized = storeURL.standardizedFileURL
-    guard standardized.lastPathComponent == "DataStore",
-          standardized.deletingLastPathComponent().lastPathComponent == "Index.noindex" else {
-        return nil
+private func sourceExtensions(for languages: Set<Language>) -> Set<String> {
+    if languages.isEmpty {
+        return ["m", "mm", "c", "cc", "cpp", "cxx", "swift"]
     }
-    return standardized.deletingLastPathComponent().deletingLastPathComponent()
+
+    var extensions = Set<String>()
+    if languages.contains(.objc) {
+        extensions.insert("m")
+        extensions.insert("mm")
+    }
+    if languages.contains(.c) {
+        extensions.insert("c")
+    }
+    if languages.contains(.cxx) {
+        extensions.insert("cc")
+        extensions.insert("cpp")
+        extensions.insert("cxx")
+        extensions.insert("mm")
+    }
+    if languages.contains(.swift) {
+        extensions.insert("swift")
+    }
+    return extensions
 }
 
 // MARK: - Root command
@@ -196,15 +231,34 @@ struct Dump: ParsableCommand {
         }
         let libURL = try LibraryDiscovery.locateLibrary()
 
+        // Parse --language args before collecting explicit units. Otherwise
+        // `--language objc` would still enqueue Swift/C/C++ units and pay their
+        // IndexStoreDB import cost before filtering emitted records.
+        var langs: Set<Language> = []
+        for raw in language {
+            guard let l = parseLanguage(raw) else {
+                throw RuntimeError("Unknown language: \(raw). Allowed: objc, swift, c, cpp")
+            }
+            langs.insert(l)
+        }
+
         let lib = try IndexStoreLibrary(dylibPath: libURL.path)
         let tmpDB = NSTemporaryDirectory() + "codegraph-xchelper-db-\(UUID().uuidString)"
         // LMDB needs the directory to already exist (especially with readonly:true).
         // We create it explicitly so the database path is unambiguous regardless of flags.
         try FileManager.default.createDirectory(atPath: tmpDB, withIntermediateDirectories: true)
-        let explicitOutputUnitPaths = collectExplicitOutputUnitPaths(
-            storeURL: storeURL,
-            sourceRoot: URL(fileURLWithPath: sourceRoot)
-        )
+        let explicitOutputUnitPaths: [String]
+        do {
+            explicitOutputUnitPaths = try collectExplicitOutputUnitPaths(
+                storeURL: storeURL,
+                libURL: libURL,
+                sourceRoot: URL(fileURLWithPath: sourceRoot),
+                languages: langs
+            )
+        } catch {
+            fputs("codegraph-xchelper: explicit output unit collection failed; falling back to full import: \(error)\n", stderr)
+            explicitOutputUnitPaths = []
+        }
         let db = try IndexStoreDB(
             storePath: storeURL.path,
             databasePath: tmpDB,
@@ -215,15 +269,6 @@ struct Dump: ParsableCommand {
         )
         if !explicitOutputUnitPaths.isEmpty {
             db.addUnitOutFilePaths(explicitOutputUnitPaths, waitForProcessing: true)
-        }
-
-        // Parse --language args into the IndexStoreDB Language enum.
-        var langs: Set<Language> = []
-        for raw in language {
-            guard let l = parseLanguage(raw) else {
-                throw RuntimeError("Unknown language: \(raw). Allowed: objc, swift, c, cpp")
-            }
-            langs.insert(l)
         }
 
         let q = Queries(

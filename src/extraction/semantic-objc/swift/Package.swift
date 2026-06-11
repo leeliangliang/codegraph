@@ -34,7 +34,15 @@ let package = Package(
             dependencies: [
                 .product(name: "IndexStoreDB", package: "indexstore-db"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "CodegraphXchelperSupport",
             ]
+        ),
+        .target(
+            name: "CodegraphXchelperSupport",
+            dependencies: [
+                .product(name: "IndexStoreDB_CXX", package: "indexstore-db"),
+            ],
+            publicHeadersPath: "include"
         ),
     ]
 )

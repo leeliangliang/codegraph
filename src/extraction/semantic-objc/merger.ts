@@ -478,6 +478,7 @@ export async function mergeFromHelper(
         seenUnits.add(unit.unit_id);
         summary.unitsMerged++;
       }
+      pruneStaleSemanticObjcUnits(db, seenUnits);
       for (const unitId of seenUnits) {
         deleteUnitFilesStmt.run(unitId);
       }
@@ -783,7 +784,20 @@ export async function mergeFromHelper(
       refsNoSource: summary.refsNoSource,
       refsNoTarget: summary.refsNoTarget,
       refsAlreadyPresent: summary.refsAlreadyPresent,
+      refsDataflowMerged: summary.refsDataflowMerged,
+      refsDataflowAlreadyPresent: summary.refsDataflowAlreadyPresent,
       refsNonCall: summary.refsNonCall,
+      dynamicCallSitesResolved: summary.dynamicCallSitesResolved,
+      dynamicDispatchSynthesized: summary.dynamicDispatchSynthesized,
+      dynamicDispatchAlreadyPresent: summary.dynamicDispatchAlreadyPresent,
+      selectorEdgesSynthesized: summary.selectorEdgesSynthesized,
+      selectorAlreadyPresent: summary.selectorAlreadyPresent,
+      ibSymbolsMarked: summary.ibSymbolsMarked,
+      asyncSymbolsMarked: summary.asyncSymbolsMarked,
+      testSymbolsMarked: summary.testSymbolsMarked,
+      frameworkConformanceMarked: summary.frameworkConformanceMarked,
+      includeEdgesMerged: summary.includeEdgesMerged,
+      declEdgesMerged: summary.declEdgesMerged,
     });
     markSemanticObjcFresh(db);
     db.exec('COMMIT');
@@ -860,6 +874,15 @@ function loadStoredSemanticObjcUnits(db: SqliteDatabase): StoredSemanticObjcUnit
     status: row.status,
     files: files.all(row.unit_id) as Array<{ filePath: string; role: string }>,
   }));
+}
+
+function pruneStaleSemanticObjcUnits(db: SqliteDatabase, seenUnits: Set<string>): void {
+  if (seenUnits.size === 0) return;
+  const unitIds = [...seenUnits];
+  const placeholders = unitIds.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM semantic_objc_unit_files WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
+  db.prepare(`DELETE FROM semantic_objc_node_ownership WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
+  db.prepare(`DELETE FROM semantic_objc_units WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
 }
 
 export function canonicaliseSymPath(

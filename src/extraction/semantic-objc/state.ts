@@ -22,7 +22,20 @@ export interface SemanticObjcMergeSummarySnapshot {
   refsNoSource: number;
   refsNoTarget: number;
   refsAlreadyPresent: number;
+  refsDataflowMerged: number;
+  refsDataflowAlreadyPresent: number;
   refsNonCall: number;
+  dynamicCallSitesResolved: number;
+  dynamicDispatchSynthesized: number;
+  dynamicDispatchAlreadyPresent: number;
+  selectorEdgesSynthesized: number;
+  selectorAlreadyPresent: number;
+  ibSymbolsMarked: number;
+  asyncSymbolsMarked: number;
+  testSymbolsMarked: number;
+  frameworkConformanceMarked: number;
+  includeEdgesMerged: number;
+  declEdgesMerged: number;
 }
 
 export interface SemanticObjcCoverageSnapshot {
