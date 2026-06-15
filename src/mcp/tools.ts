@@ -2759,6 +2759,20 @@ export class ToolHandler {
     if (semanticObjc.staleReason) {
       lines.push(`**Semantic ObjC stale reason:** ${semanticObjc.staleReason}`);
     }
+    if (semanticObjc.snapshot?.lastSuccessFingerprint) {
+      const captured = semanticObjc.snapshot.lastSuccessCapturedAt
+        ? `, captured ${new Date(semanticObjc.snapshot.lastSuccessCapturedAt).toISOString()}`
+        : '';
+      lines.push(`**Semantic ObjC stable snapshot:** ${semanticObjc.snapshot.lastSuccessFingerprint}${captured}`);
+    }
+    if (semanticObjc.snapshot?.pendingFingerprint || semanticObjc.snapshot?.pendingReason) {
+      const pending = [
+        semanticObjc.snapshot.pendingFingerprint ? `fingerprint ${semanticObjc.snapshot.pendingFingerprint}` : null,
+        semanticObjc.snapshot.pendingCapturedAt ? `captured ${new Date(semanticObjc.snapshot.pendingCapturedAt).toISOString()}` : null,
+        semanticObjc.snapshot.pendingReason ? `reason ${semanticObjc.snapshot.pendingReason}` : null,
+      ].filter(Boolean).join(', ');
+      lines.push(`**Semantic ObjC pending snapshot:** ${pending}`);
+    }
     if (semanticObjc.coverage) {
       lines.push(
         `**Semantic ObjC coverage:** ${semanticObjc.coverage.nodesWithUsr} nodes with USR, ` +

@@ -37,9 +37,9 @@ const loadCodeGraph = (): typeof import('../index').default =>
 
 export interface MCPEngineOptions {
   /**
-   * Whether to start the file watcher when initializing. Daemon and direct
-   * modes both want this true; tests may set it false to keep the engine
-   * cheap. Honors {@link watchDisabledReason} regardless.
+   * Whether to start automatic watchers when initializing. Daemon and direct
+   * modes both want this true; proxy fallback and tests may set it false to
+   * keep the engine cheap. Honors {@link watchDisabledReason} regardless.
    */
   watch?: boolean;
 
@@ -283,8 +283,19 @@ export class MCPEngine {
     const watcherOptions: SemanticObjcIndexStoreWatcherOptions = {
       config,
       lockPath: cg.getGraphLockPath(),
+      sourceRoot,
       isIdle: () => isSemanticObjcGraphIdle(cg),
       onState: (status, reason) => this.persistSemanticObjcWatchState(cg, status, reason),
+      snapshot: async (signal?: AbortSignal) => {
+        const { spawnSemanticObjcSnapshot } = await import('../extraction/semantic-objc');
+        return spawnSemanticObjcSnapshot({
+          helperPath,
+          storePath,
+          sourceRoot,
+          languages: config.languages,
+          signal,
+        });
+      },
       onSemanticDelta: async () => {
         await cg.enrichSemanticObjcWithGraphLockHeld({
           helperPath,
@@ -352,7 +363,9 @@ export class MCPEngine {
         process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
       });
     this.toolHandler.setCatchUpGate(p);
-    void p.finally(() => { void this.startSemanticObjcWatching(); });
+    if (this.opts.watch) {
+      void p.finally(() => { void this.startSemanticObjcWatching(); });
+    }
   }
 }
 

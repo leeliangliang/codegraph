@@ -15,6 +15,7 @@ export {
   findShippedHelperBinary,
   locateHelperBinary,
   spawnHelper,
+  spawnSemanticObjcSnapshot,
   recordSourceHandle,
   parseNdjsonLine,
 } from './spawner';
@@ -35,6 +36,29 @@ export {
   waitForIndexStoreQuiescence,
 } from './quiescence';
 export type { IndexStoreQuiescenceOptions, IndexStoreSnapshot } from './quiescence';
+export {
+  compareSemanticObjcSnapshots,
+  evaluateSemanticObjcSnapshotReadiness,
+  isSemanticObjcSnapshotRecord,
+  isSemanticObjcSnapshotPublicationGateError,
+  isSemanticObjcSnapshotRaceError,
+  normalizeSemanticObjcSnapshot,
+  parseSemanticObjcSnapshotLine,
+  semanticObjcSnapshotNotReadyReason,
+  semanticObjcSnapshotStability,
+  SEMANTIC_OBJC_SNAPSHOT_NOT_READY_PREFIX,
+  SEMANTIC_OBJC_SNAPSHOT_RACE_REASON,
+  stableSnapshotKey,
+  waitForSemanticObjcSnapshotStability,
+} from './snapshot';
+export type {
+  NormalizedSemanticObjcSnapshot,
+  SemanticObjcSnapshotReadiness,
+  SemanticObjcSnapshotRecord,
+  SemanticObjcSnapshotStability,
+  SemanticObjcSnapshotStabilityWaitOptions,
+  SemanticObjcSnapshotStabilityWaitOutcome,
+} from './snapshot';
 export { SemanticObjcIdleScheduler } from './scheduler';
 export type { SemanticObjcIdleSchedulerOptions, SemanticObjcJobResult } from './scheduler';
 export { SemanticObjcIndexStoreWatcher } from './watch';
@@ -61,6 +85,7 @@ export type {
   SemanticObjcCoverageSnapshot,
   SemanticObjcDiagnostic,
   SemanticObjcMergeSummarySnapshot,
+  SemanticObjcSnapshotState,
   SemanticObjcStateSnapshot,
   SemanticObjcStatus,
 } from './state';
@@ -87,9 +112,17 @@ import * as path from 'node:path';
 import type { SqliteDatabase } from '../../db/sqlite-adapter';
 import type { QueryBuilder } from '../../db/queries';
 import type { FileRecord } from '../../types';
-import { spawnHelper } from './spawner';
-import { mergeFromHelper, type MergeSummary } from './merger';
-
+import { spawnHelper, spawnSemanticObjcSnapshot, type SpawnerHandle } from './spawner';
+import { mergeFromHelper, type MergePublicationGateResult, type MergeSummary } from './merger';
+import { markSemanticObjcQueued, setSemanticObjcStateValue } from './state';
+import {
+  compareSemanticObjcSnapshots,
+  evaluateSemanticObjcSnapshotReadiness,
+  semanticObjcSnapshotNotReadyReason,
+  SEMANTIC_OBJC_SNAPSHOT_RACE_REASON,
+  stableSnapshotKey,
+  type SemanticObjcSnapshotRecord,
+} from './snapshot';
 export interface EnrichOptions {
   /** Absolute path to the `codegraph-xchelper` binary. */
   helperPath: string;
@@ -111,6 +144,10 @@ export interface EnrichOptions {
   languages?: string[];
   /** Include SDK / system header occurrences. Default false. */
   includeSystem?: boolean;
+  /** Test/orchestrator hook for pre/post semantic snapshot publication gating. */
+  snapshot?: () => Promise<SemanticObjcSnapshotRecord>;
+  /** Test hook for supplying a helper handle without spawning the Swift binary. */
+  helperHandleFactory?: () => SpawnerHandle;
 }
 
 /**
@@ -123,17 +160,63 @@ export async function enrichWithIndexStore(
   opts: EnrichOptions
 ): Promise<MergeSummary> {
   const helperSourceRoot = opts.helperSourceRoot ?? inferSemanticObjcSourceRoot(opts.projectRoot, opts.queries ?? opts.files);
-  const handle = spawnHelper({
+  const makeHandle = () => opts.helperHandleFactory?.() ?? spawnHelper({
     helperPath: opts.helperPath,
     sourceRoot: helperSourceRoot,
     storePath: opts.storePath,
     languages: opts.languages,
     includeSystem: opts.includeSystem,
   });
-  return mergeFromHelper(db, handle, {
+
+  const snapshot = opts.snapshot ?? (() => spawnSemanticObjcSnapshot({
+    helperPath: opts.helperPath,
+    sourceRoot: helperSourceRoot,
+    storePath: opts.storePath,
+    languages: opts.languages,
+    includeSystem: opts.includeSystem,
+  }));
+
+  const snapshotBefore = await snapshot();
+  assertSnapshotReadyForPublication(db, snapshotBefore);
+
+  return mergeFromHelper(db, makeHandle(), {
     projectRoot: opts.projectRoot,
     helperSourceRoot,
+    publicationGate: async (): Promise<MergePublicationGateResult> => {
+      const snapshotAfter = await snapshot();
+      assertSnapshotReadyForPublication(db, snapshotAfter);
+      if (!compareSemanticObjcSnapshots(snapshotBefore, snapshotAfter)) {
+        const now = Date.now();
+        setSemanticObjcStateValue(db, 'pending_snapshot_fingerprint', stableSnapshotKey(snapshotAfter), now);
+        if (snapshotAfter.capturedAtMs !== undefined) {
+          setSemanticObjcStateValue(db, 'pending_snapshot_captured_at', String(snapshotAfter.capturedAtMs), now);
+        }
+        setSemanticObjcStateValue(db, 'pending_reason', SEMANTIC_OBJC_SNAPSHOT_RACE_REASON, now);
+        setSemanticObjcStateValue(db, 'last_snapshot_race_at', String(now), now);
+        markSemanticObjcQueued(db, SEMANTIC_OBJC_SNAPSHOT_RACE_REASON, now);
+        throw new Error(SEMANTIC_OBJC_SNAPSHOT_RACE_REASON);
+      }
+      return {
+        stableSnapshotFingerprint: stableSnapshotKey(snapshotAfter),
+        stableSnapshotCapturedAt: snapshotAfter.capturedAtMs,
+      };
+    },
   });
+}
+
+function assertSnapshotReadyForPublication(db: SqliteDatabase, snapshot: SemanticObjcSnapshotRecord): void {
+  const readiness = evaluateSemanticObjcSnapshotReadiness(snapshot);
+  if (readiness.ready) return;
+
+  const now = Date.now();
+  const reason = semanticObjcSnapshotNotReadyReason(readiness.reason);
+  setSemanticObjcStateValue(db, 'pending_snapshot_fingerprint', stableSnapshotKey(snapshot), now);
+  if (snapshot.capturedAtMs !== undefined) {
+    setSemanticObjcStateValue(db, 'pending_snapshot_captured_at', String(snapshot.capturedAtMs), now);
+  }
+  setSemanticObjcStateValue(db, 'pending_reason', reason, now);
+  markSemanticObjcQueued(db, reason, now);
+  throw new Error(reason);
 }
 
 export function inferSemanticObjcSourceRoot(projectRoot: string, source?: QueryBuilder | FileRecord[]): string {

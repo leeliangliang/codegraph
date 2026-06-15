@@ -59,6 +59,7 @@ import {
 import {
   enrichWithIndexStore,
   inferSemanticObjcSourceRoot,
+  isSemanticObjcSnapshotPublicationGateError,
   locateHelperBinary,
   type EnrichOptions,
   type MergeSummary,
@@ -644,6 +645,8 @@ export class CodeGraph {
     } catch (err) {
       if (isRetryableSemanticObjcLockError(err)) {
         markSemanticObjcQueued(this.db.getDb(), 'graph-lock-busy');
+      } else if (isSemanticObjcSnapshotPublicationGateError(err)) {
+        // enrichWithIndexStore already persisted the queued snapshot state.
       } else {
         markSemanticObjcFailed(this.db.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
       }
@@ -675,6 +678,8 @@ export class CodeGraph {
     } catch (err) {
       if (isRetryableSemanticObjcLockError(err)) {
         markSemanticObjcQueued(this.db.getDb(), 'graph-lock-busy');
+      } else if (isSemanticObjcSnapshotPublicationGateError(err)) {
+        // enrichWithIndexStore already persisted the queued snapshot state.
       } else {
         markSemanticObjcFailed(this.db.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
       }

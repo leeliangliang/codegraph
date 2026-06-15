@@ -10,6 +10,10 @@ export interface SemanticObjcRewriteSummary {
   ownershipRowsDeleted: number;
 }
 
+export interface SemanticObjcDeltaRewriteApplyOptions {
+  updateState?: boolean;
+}
+
 export function applySemanticObjcDeltaRewrite(
   db: SqliteDatabase,
   plan: SemanticObjcDeltaPlan,
@@ -17,7 +21,9 @@ export function applySemanticObjcDeltaRewrite(
 ): SemanticObjcRewriteSummary {
   db.exec('BEGIN');
   try {
-    const summary = applySemanticObjcDeltaRewriteInTransaction(db, plan, now);
+    const summary = applySemanticObjcDeltaRewriteInTransaction(db, plan, now, {
+      updateState: true,
+    });
     db.exec('COMMIT');
     return summary;
   } catch (err) {
@@ -26,14 +32,16 @@ export function applySemanticObjcDeltaRewrite(
   }
 }
 
-function applySemanticObjcDeltaRewriteInTransaction(
+export function applySemanticObjcDeltaRewriteInTransaction(
   db: SqliteDatabase,
   plan: SemanticObjcDeltaPlan,
-  now: number
+  now = Date.now(),
+  options: SemanticObjcDeltaRewriteApplyOptions = {}
 ): SemanticObjcRewriteSummary {
+  const updateState = options.updateState ?? true;
   if (plan.mode !== 'delta') {
     const reason = plan.reason ?? 'semantic-delta-unsafe';
-    markSemanticObjcStale(db, reason, now);
+    if (updateState) markSemanticObjcStale(db, reason, now);
     return {
       mode: 'stale',
       staleReason: reason,
@@ -45,7 +53,7 @@ function applySemanticObjcDeltaRewriteInTransaction(
 
   const affectedUnitIds = [...new Set([...plan.changedUnitIds, ...plan.removedUnitIds])];
   if (affectedUnitIds.length === 0) {
-    markSemanticObjcFresh(db, now);
+    if (updateState) markSemanticObjcFresh(db, now);
     return { mode: 'rewritten', nodesCleared: 0, edgesDeleted: 0, ownershipRowsDeleted: 0 };
   }
 
@@ -53,7 +61,7 @@ function applySemanticObjcDeltaRewriteInTransaction(
   const nodesCleared = clearNodeUsrs(db, affectedNodes);
   const edgesDeleted = deleteSemanticEdges(db, affectedNodes);
   const ownershipRowsDeleted = deleteOwnershipRows(db, affectedUnitIds, affectedNodes);
-  markSemanticObjcFresh(db, now);
+  if (updateState) markSemanticObjcFresh(db, now);
 
   return {
     mode: 'rewritten',

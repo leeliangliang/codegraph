@@ -45,7 +45,7 @@
     "web-tree-sitter": "^0.25.3"
   },
   "optionalDependencies": {
-    "@colbymchenry/codegraph-mac-objc-enricher": "^0.9.4"
+    "@colbymchenry/codegraph-mac-objc-enricher": "^0.9.9"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",

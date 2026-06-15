@@ -27,6 +27,10 @@ import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import type { MCPEngine } from './engine';
+import {
+  daemonSemanticObjcConfigMatches,
+  type DaemonSemanticObjcConfigInfo,
+} from './daemon-config';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
@@ -41,6 +45,13 @@ export interface ProxyResult {
   outcome: 'proxied' | 'fallback-needed';
   reason?: string;
 }
+
+export interface DaemonSemanticConfigMismatch {
+  kind: 'semantic-config-mismatch';
+  hello: DaemonHello;
+}
+
+export type ConnectWithHelloResult = net.Socket | 'version-mismatch' | DaemonSemanticConfigMismatch | null;
 
 /**
  * Attempt to connect to the daemon at `socketPath` and pipe stdio through it.
@@ -109,7 +120,8 @@ export async function runProxy(
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
-): Promise<net.Socket | 'version-mismatch' | null> {
+  expectedSemanticObjc?: DaemonSemanticObjcConfigInfo,
+): Promise<ConnectWithHelloResult> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
@@ -127,6 +139,18 @@ export async function connectWithHello(
     );
     socket.destroy();
     return 'version-mismatch';
+  }
+  if (
+    expectedSemanticObjc &&
+    !daemonSemanticObjcConfigMatches(hello.semanticObjc, expectedSemanticObjc)
+  ) {
+    process.stderr.write(
+      `[CodeGraph MCP] Found a daemon on ${socketPath} but its Semantic ObjC watch config ` +
+      `(${hello.semanticObjc?.watchActive ? hello.semanticObjc.fingerprint : 'disabled'}) differs ` +
+      `from ours (${expectedSemanticObjc.watchActive ? expectedSemanticObjc.fingerprint : 'disabled'}); restarting the shared daemon.\n`
+    );
+    socket.destroy();
+    return { kind: 'semantic-config-mismatch', hello };
   }
   process.stderr.write(
     `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`

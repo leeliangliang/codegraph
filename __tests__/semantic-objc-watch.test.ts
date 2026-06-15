@@ -16,6 +16,7 @@ import {
   getSemanticObjcState,
   markSemanticObjcQueued,
   markSemanticObjcStale,
+  setSemanticObjcStateValue,
 } from '../src/extraction/semantic-objc';
 
 function createTempDir(): string {
@@ -206,10 +207,362 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
     }
   });
 
+  it('ignores watcher notifications when the IndexStore snapshot did not change', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let runs = 0;
+    const states: string[] = [];
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config: parseSemanticObjcWatchConfig({
+        enabled: true,
+        watchIndexStore: true,
+        storePath,
+        quiescence: { sampleIntervalMs: 1, stableSamples: 1, maxWaitMs: 20 },
+      }),
+      isIdle: () => true,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => { runs++; },
+    });
+    (watcher as unknown as { lastIndexStoreSnapshot: ReturnType<typeof sampleIndexStoreSnapshot> | null })
+      .lastIndexStoreSnapshot = sampleIndexStoreSnapshot(storePath);
+
+    try {
+      watcher.notifyChanged();
+      await vi.runAllTimersAsync();
+      expect(runs).toBe(0);
+      expect(states).not.toContain('queued:indexstore-changed');
+      expect(states).not.toContain('running');
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not enqueue semantic work when directory is quiet but semantic snapshots keep changing', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let runs = 0;
+    let snapshotIndex = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 3, maxWaitMs: 5 };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => ({
+        t: 'snapshot',
+        helperVersion: 'codegraph-xchelper 1.1.1',
+        semanticDeltaVersion: 1,
+        unitFingerprintAlgorithm: 'index-unit-v1',
+        recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+        sourceMembership: true,
+        languageFilter: ['objc'],
+        includeSystem: false,
+        explicitOutputUnits: true,
+        unitCount: 1,
+        unitFileCount: 1,
+        sourceMembershipCount: 1,
+        aggregateFingerprint: `fp-${snapshotIndex++}`,
+      }),
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => { runs++; },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(runs).toBe(0);
+      expect(states).toContain('queued:semantic-snapshot-wait');
+      expect(states.some((state) => state.startsWith('stale:semantic-snapshot-timeout'))).toBe(true);
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off repeated semantic snapshot stability retries', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let snapshotIndex = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 3, maxWaitMs: 5 };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => ({
+        t: 'snapshot',
+        helperVersion: 'codegraph-xchelper 1.1.1',
+        semanticDeltaVersion: 1,
+        unitFingerprintAlgorithm: 'index-unit-v1',
+        recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+        sourceMembership: true,
+        languageFilter: ['objc'],
+        includeSystem: false,
+        explicitOutputUnits: true,
+        unitCount: 1,
+        unitFileCount: 1,
+        sourceMembershipCount: 1,
+        aggregateFingerprint: `fp-${snapshotIndex++}`,
+      }),
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => { throw new Error('should not run while snapshots change'); },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(20);
+      const waitsAfterFirstTimeout = states.filter((state) => state === 'queued:semantic-snapshot-wait').length;
+      expect(waitsAfterFirstTimeout).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(900);
+      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstTimeout);
+
+      await vi.advanceTimersByTimeAsync(200);
+      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstTimeout + 1);
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('enqueues semantic work after semantic snapshots become stable', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let runs = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 2, maxWaitMs: 20 };
+    const snapshot = {
+      t: 'snapshot' as const,
+      helperVersion: 'codegraph-xchelper 1.1.1',
+      semanticDeltaVersion: 1,
+      unitFingerprintAlgorithm: 'index-unit-v1',
+      recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+      sourceMembership: true,
+      languageFilter: ['objc'],
+      includeSystem: false,
+      explicitOutputUnits: true,
+      unitCount: 1,
+      unitFileCount: 1,
+      sourceMembershipCount: 1,
+      aggregateFingerprint: 'stable',
+    };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => snapshot,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => { runs++; },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.runAllTimersAsync();
+      expect(runs).toBe(1);
+      expect(states).toContain('queued:semantic-snapshot-wait');
+      expect(states).toContain('fresh');
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds retries when stable snapshots still race during semantic dump publication', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let runs = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 1, maxWaitMs: 20 };
+    const snapshot = {
+      t: 'snapshot' as const,
+      helperVersion: 'codegraph-xchelper 1.1.1',
+      semanticDeltaVersion: 1,
+      unitFingerprintAlgorithm: 'index-unit-v1',
+      recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+      sourceMembership: true,
+      languageFilter: ['objc'],
+      includeSystem: false,
+      explicitOutputUnits: true,
+      unitCount: 1,
+      unitFileCount: 1,
+      sourceMembershipCount: 1,
+      aggregateFingerprint: 'stable',
+    };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => snapshot,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => {
+        runs++;
+        throw new Error('semantic-snapshot-race');
+      },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(runs).toBe(4);
+      expect(states).toContain('queued:semantic-snapshot-race');
+      expect(states).toContain('stale:semantic-snapshot-race-retry-exhausted');
+      expect(states.some((state) => state.startsWith('failed:'))).toBe(false);
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds retries when a delayed scheduler job hits a semantic snapshot publication race', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let idle = false;
+    let runs = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 1, maxWaitMs: 20 };
+    const snapshot = {
+      t: 'snapshot' as const,
+      helperVersion: 'codegraph-xchelper 1.1.1',
+      semanticDeltaVersion: 1,
+      unitFingerprintAlgorithm: 'index-unit-v1',
+      recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+      sourceMembership: true,
+      languageFilter: ['objc'],
+      includeSystem: false,
+      explicitOutputUnits: true,
+      unitCount: 1,
+      unitFileCount: 1,
+      sourceMembershipCount: 1,
+      aggregateFingerprint: 'stable',
+    };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => idle,
+      snapshot: async () => snapshot,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => {
+        runs++;
+        throw new Error('semantic-snapshot-race');
+      },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(runs).toBe(0);
+      expect(states).toContain('queued:graph-busy');
+
+      idle = true;
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(runs).toBe(4);
+      expect(states).toContain('queued:semantic-snapshot-race');
+      expect(states).toContain('stale:semantic-snapshot-race-retry-exhausted');
+      expect(states.some((state) => state.startsWith('failed:'))).toBe(false);
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds retries when stable snapshots become not-ready during semantic dump publication', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    let runs = 0;
+    const states: string[] = [];
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 1, maxWaitMs: 20 };
+    const snapshot = {
+      t: 'snapshot' as const,
+      helperVersion: 'codegraph-xchelper 1.1.1',
+      semanticDeltaVersion: 1,
+      unitFingerprintAlgorithm: 'index-unit-v1',
+      recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+      sourceMembership: true,
+      languageFilter: ['objc'],
+      includeSystem: false,
+      explicitOutputUnits: true,
+      unitCount: 1,
+      unitFileCount: 1,
+      sourceMembershipCount: 1,
+      aggregateFingerprint: 'stable',
+    };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => snapshot,
+      onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
+      onSemanticDelta: async () => {
+        runs++;
+        throw new Error('semantic-snapshot-not-ready:snapshot-missing-units');
+      },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(runs).toBe(4);
+      expect(states).toContain('queued:semantic-snapshot-not-ready:snapshot-missing-units');
+      expect(states).toContain('stale:semantic-snapshot-not-ready:snapshot-missing-units-retry-exhausted');
+      expect(states.some((state) => state.startsWith('failed:'))).toBe(false);
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('surfaces semantic ObjC freshness in MCP status', async () => {
     const dbPath = path.join(tempDir, '.codegraph', 'codegraph.db');
     const conn = DatabaseConnection.initialize(dbPath);
     markSemanticObjcStale(conn.getDb(), 'test-stale', 123);
+    setSemanticObjcStateValue(conn.getDb(), 'last_success_snapshot_fingerprint', 'stable-fp', 123);
+    setSemanticObjcStateValue(conn.getDb(), 'pending_snapshot_fingerprint', 'pending-fp', 124);
+    setSemanticObjcStateValue(conn.getDb(), 'pending_reason', 'semantic-snapshot-race', 124);
     conn.close();
 
     const cg = CodeGraph.openSync(tempDir);
@@ -219,6 +572,8 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
       const text = result.content[0]?.text ?? '';
       expect(text).toContain('**Semantic ObjC:** stale');
       expect(text).toContain('**Semantic ObjC stale reason:** test-stale');
+      expect(text).toContain('**Semantic ObjC stable snapshot:** stable-fp');
+      expect(text).toContain('**Semantic ObjC pending snapshot:** fingerprint pending-fp, reason semantic-snapshot-race');
       expect(text).toContain('**Semantic ObjC coverage:**');
       expect(text).toContain('**Semantic ObjC units:**');
     } finally {
@@ -414,6 +769,34 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
     } finally {
       engine.stop();
       cg.close();
+    }
+  });
+
+  it('does not start Semantic ObjC watching when engine auto-watch is disabled', async () => {
+    const engine = new MCPEngine({
+      watch: false,
+      semanticObjc: { enabled: true, watchIndexStore: true },
+    });
+    const startSemanticObjcWatching = vi.fn(async () => undefined);
+    const internal = engine as unknown as {
+      cg: {
+        sync: () => Promise<{ filesAdded: number; filesModified: number; filesRemoved: number }>;
+      };
+      catchUpSync: () => void;
+      startSemanticObjcWatching: () => Promise<void>;
+    };
+    internal.cg = {
+      sync: vi.fn(async () => ({ filesAdded: 0, filesModified: 0, filesRemoved: 0 })),
+    };
+    internal.startSemanticObjcWatching = startSemanticObjcWatching;
+
+    try {
+      internal.catchUpSync();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(startSemanticObjcWatching).not.toHaveBeenCalled();
+    } finally {
+      engine.stop();
     }
   });
 

@@ -3,6 +3,7 @@
 // Subcommands:
 //   discover      Find the Index.noindex/DataStore for a given source root.
 //   dump          Emit the full IndexStoreDB content as NDJSON on stdout.
+//   snapshot      Emit a compact semantic unit/membership readiness snapshot.
 //   status        Print store path + mtime + a small probe of contents.
 //
 // All subcommands fail with a non-zero exit code and a human-readable error on stderr
@@ -179,7 +180,7 @@ struct Xchelper: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "codegraph-xchelper",
         abstract: "Emit Xcode IndexStore data as NDJSON for CodeGraph semantic enrichment.",
-        subcommands: [Discover.self, Dump.self, Status.self]
+        subcommands: [Discover.self, Dump.self, Snapshot.self, Status.self]
     )
 }
 
@@ -278,6 +279,87 @@ struct Dump: ParsableCommand {
             includeSystem: includeSystem
         )
         _ = try q.dumpAll()
+    }
+}
+
+// MARK: - snapshot
+
+struct Snapshot: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Emit a compact semantic unit/membership readiness snapshot as JSON."
+    )
+
+    @Option(name: .long, help: "Path to Index.noindex/DataStore. If omitted, will run discovery from --source-root.")
+    var storePath: String?
+
+    @Option(name: .long, help: "Project source root (used to make file paths relative).")
+    var sourceRoot: String
+
+    @Option(name: .long, parsing: .upToNextOption, help: "Languages to include (objc, swift, c, cpp). Empty = all.")
+    var language: [String] = []
+
+    @Flag(name: .long, help: "Include occurrences in SDK / system headers (default: filtered out).")
+    var includeSystem: Bool = false
+
+    func run() throws {
+        let storeURL: URL
+        if let p = storePath {
+            storeURL = URL(fileURLWithPath: p)
+        } else {
+            storeURL = try DerivedDataDiscovery.locateStore(for: URL(fileURLWithPath: sourceRoot))
+        }
+        let libURL = try LibraryDiscovery.locateLibrary()
+
+        var langs: Set<Language> = []
+        for raw in language {
+            guard let l = parseLanguage(raw) else {
+                throw RuntimeError("Unknown language: \(raw). Allowed: objc, swift, c, cpp")
+            }
+            langs.insert(l)
+        }
+
+        let lib = try IndexStoreLibrary(dylibPath: libURL.path)
+        let tmpDB = NSTemporaryDirectory() + "codegraph-xchelper-snapshot-db-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmpDB, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: tmpDB)
+        }
+        let explicitOutputUnitPaths: [String]
+        do {
+            explicitOutputUnitPaths = try collectExplicitOutputUnitPaths(
+                storeURL: storeURL,
+                libURL: libURL,
+                sourceRoot: URL(fileURLWithPath: sourceRoot),
+                languages: langs
+            )
+        } catch {
+            fputs("codegraph-xchelper: explicit output unit collection failed; falling back to full import: \(error)\n", stderr)
+            explicitOutputUnitPaths = []
+        }
+        do {
+            let db = try IndexStoreDB(
+                storePath: storeURL.path,
+                databasePath: tmpDB,
+                library: lib,
+                useExplicitOutputUnits: !explicitOutputUnitPaths.isEmpty,
+                waitUntilDoneInitializing: explicitOutputUnitPaths.isEmpty,
+                listenToUnitEvents: false
+            )
+            if !explicitOutputUnitPaths.isEmpty {
+                db.addUnitOutFilePaths(explicitOutputUnitPaths, waitForProcessing: true)
+            }
+
+            let q = Queries(
+                db: db,
+                sourceRoot: URL(fileURLWithPath: sourceRoot).resolvingSymlinksInPath().standardized.path,
+                languageFilter: langs,
+                includeSystem: includeSystem
+            )
+            try q.snapshot(
+                explicitOutputUnits: !explicitOutputUnitPaths.isEmpty,
+                expectedUnitCount: explicitOutputUnitPaths.isEmpty ? nil : explicitOutputUnitPaths.count
+            )
+        }
     }
 }
 

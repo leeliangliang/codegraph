@@ -36,7 +36,7 @@ export async function waitForIndexStoreQuiescence(
 
   while (Date.now() - startedAt <= options.maxWaitMs) {
     const current = sampleIndexStoreSnapshot(storePath);
-    if (previous && sameSnapshot(previous, current)) {
+    if (previous && sameIndexStoreSnapshot(previous, current)) {
       stableCount++;
       if (stableCount >= options.stableSamples) return current;
     } else {
@@ -75,7 +75,7 @@ function visitFiles(root: string, snapshot: IndexStoreSnapshot): void {
   }
 }
 
-function sameSnapshot(a: IndexStoreSnapshot, b: IndexStoreSnapshot): boolean {
+export function sameIndexStoreSnapshot(a: IndexStoreSnapshot, b: IndexStoreSnapshot): boolean {
   return a.fileCount === b.fileCount && a.latestMtimeMs === b.latestMtimeMs && a.totalSize === b.totalSize;
 }
 

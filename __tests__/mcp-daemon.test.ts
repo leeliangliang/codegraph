@@ -39,6 +39,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import type { DaemonLockInfo } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -49,8 +50,8 @@ interface SpawnedServer {
   stderr: string[];
 }
 
-function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}, extraArgs: string[] = []): SpawnedServer {
+  const child = spawn(process.execPath, [BIN, 'serve', '--mcp', ...extraArgs], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env },
@@ -137,11 +138,28 @@ function isAlive(pid: number): boolean {
 }
 
 function readLockPid(root: string): number | null {
+  const info = readLockInfo(root);
+  return info && typeof info.pid === 'number' ? info.pid : null;
+}
+
+function readLockInfo(root: string): DaemonLockInfo | null {
+  return readLockInfos(root)[0] ?? null;
+}
+
+function readLockInfos(root: string): DaemonLockInfo[] {
   try {
-    const raw = fs.readFileSync(path.join(root, '.codegraph', 'daemon.pid'), 'utf8');
-    const info = JSON.parse(raw);
-    return typeof info.pid === 'number' ? info.pid : null;
-  } catch { return null; }
+    return fs.readdirSync(path.join(root, '.codegraph'))
+      .filter((name) => /^daemon(?:-[a-f0-9]{16})?\.pid$/.test(name))
+      .map((name) => {
+        try {
+          const raw = fs.readFileSync(path.join(root, '.codegraph', name), 'utf8');
+          return JSON.parse(raw) as DaemonLockInfo;
+        } catch {
+          return null;
+        }
+      })
+      .filter((info): info is DaemonLockInfo => !!info);
+  } catch { return []; }
 }
 
 function readDaemonLog(root: string): string {
@@ -181,9 +199,11 @@ describe('Shared MCP daemon (issue #411)', () => {
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
     // lockfile, and we must never SIGKILL the vitest worker.
-    const daemonPid = readLockPid(realRoot);
-    if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
-      try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+    for (const info of readLockInfos(realRoot)) {
+      const daemonPid = info.pid;
+      if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
+        try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      }
     }
     await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
@@ -359,6 +379,49 @@ describe('Shared MCP daemon (issue #411)', () => {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
     }
   }, 30000);
+
+  it('uses a separate shared daemon when a semantic ObjC launcher needs different watch config', async () => {
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '200' };
+
+    const plain = spawnServer(tempDir, env);
+    servers.push(plain);
+    sendInitialize(plain.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(plain.stdout, 1), 10000);
+    await waitFor(() => plain.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
+    const oldPid = readLockPid(realRoot);
+    expect(oldPid).toBeTruthy();
+    expect(readLockInfo(realRoot)?.semanticObjc?.watchActive).toBe(false);
+
+    const semantic = spawnServer(tempDir, env, [
+      '--semantic-objc-config',
+      '{"enabled":true,"watchIndexStore":true}',
+    ]);
+    servers.push(semantic);
+    sendInitialize(semantic.child, `file://${tempDir}`, 2);
+    const resp = await waitFor(() => findResponse(semantic.stdout, 2), 10000).catch((e) => {
+      throw new Error(`${(e as Error).message}\nstdout:\n${semantic.stdout.join('\n')}\nstderr:\n${semantic.stderr.join('\n')}\ndaemon.log:\n${readDaemonLog(realRoot)}`);
+    });
+    expect(resp.result.serverInfo.name).toBe('codegraph');
+    await waitFor(() => semantic.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
+    expect(semantic.stderr.some((l) => l.includes('Semantic ObjC watch config changed'))).toBe(false);
+
+    const semanticLock = await waitFor(
+      () => readLockInfos(realRoot).find((info) => info.semanticObjc?.watchActive),
+      10000,
+    );
+    expect(semanticLock.pid).not.toBe(oldPid);
+    expect(isAlive(semanticLock.pid)).toBe(true);
+    expect(readLockInfos(realRoot).some((info) => info.pid === oldPid)).toBe(true);
+    expect(isAlive(oldPid!)).toBe(true);
+    expect(countListeningLines(realRoot)).toBeGreaterThanOrEqual(2);
+  }, 50000);
+
+  it('keeps plain proxy fallback sessions watchful but disables semantic ObjC fallback watching', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../src/mcp/index.ts'), 'utf8');
+
+    expect(source).toContain('watch: !expectedSemanticObjc.watchActive');
+    expect(source).not.toContain('new MCPEngine({ watch: false, semanticObjc: this.semanticObjc })');
+  });
 
   it('local-handshake proxy falls back in-process when the daemon disconnects mid-session', async () => {
     const net = await import('net');

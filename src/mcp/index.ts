@@ -47,8 +47,9 @@ import {
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
-import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketPath } from './daemon-paths';
+import { connectWithHello, runLocalHandshakeProxy, type DaemonSemanticConfigMismatch, type ConnectWithHelloResult } from './proxy';
+import { getDaemonPidPath, getDaemonSocketPath } from './daemon-paths';
+import { describeDaemonSemanticObjcConfig } from './daemon-config';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 /**
@@ -206,6 +207,37 @@ function spawnDetachedDaemon(root: string, semanticObjc?: unknown): void {
   }
 }
 
+function isSemanticConfigMismatch(result: ConnectWithHelloResult): result is DaemonSemanticConfigMismatch {
+  return !!result && typeof result === 'object' && 'kind' in result && result.kind === 'semantic-config-mismatch';
+}
+
+async function retireDaemonForSemanticConfigChange(root: string, mismatch: DaemonSemanticConfigMismatch): Promise<boolean> {
+  const pid = mismatch.hello.pid;
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  process.stderr.write(
+    `[CodeGraph MCP] Restarting shared daemon pid ${pid} because Semantic ObjC watch config changed.\n`
+  );
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err: unknown) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== 'ESRCH') {
+      process.stderr.write(`[CodeGraph MCP] Could not stop incompatible daemon pid ${pid}: ${e.message}\n`);
+      return false;
+    }
+  }
+
+  for (let attempt = 0; attempt < 60; attempt++) {
+    if (!isProcessAlive(pid)) {
+      clearStaleDaemonLock(getDaemonPidPath(root, mismatch.hello.semanticObjc), pid);
+      return true;
+    }
+    await sleep(50);
+  }
+  process.stderr.write(`[CodeGraph MCP] Incompatible daemon pid ${pid} did not exit; serving in-process.\n`);
+  return false;
+}
+
 /**
  * MCP Server for CodeGraph
  *
@@ -359,7 +391,7 @@ export class MCPServer {
   private async startDaemonProcess(): Promise<void> {
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
-      const lock = tryAcquireDaemonLock(root);
+      const lock = tryAcquireDaemonLock(root, { semanticObjc: this.semanticObjc });
 
       if (lock.kind === 'acquired') {
         const daemon = new Daemon(root, { semanticObjc: this.semanticObjc });
@@ -398,25 +430,44 @@ export class MCPServer {
    * never wedges a session.
    */
   private async runProxyWithLocalHandshake(root: string): Promise<void> {
-    const socketPath = getDaemonSocketPath(root);
+    const expectedSemanticObjc = describeDaemonSemanticObjcConfig(this.semanticObjc);
+    const socketPath = getDaemonSocketPath(root, expectedSemanticObjc);
     const getDaemonSocket = async () => {
       // Fast path: a daemon may already be listening.
-      const probe = await connectWithHello(socketPath);
+      const probe = await connectWithHello(socketPath, undefined, expectedSemanticObjc);
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
-      if (probe) return probe;
+      if (isSemanticConfigMismatch(probe)) {
+        const retired = await retireDaemonForSemanticConfigChange(root, probe);
+        if (!retired) return null;
+      } else if (probe) {
+        return probe;
+      }
       // None reachable — spawn one (detached) and poll for its bind.
       spawnDetachedDaemon(root, this.semanticObjc);
       for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
         await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const s = await connectWithHello(socketPath);
+        const s = await connectWithHello(socketPath, undefined, expectedSemanticObjc);
         if (s === 'version-mismatch') return null;
+        if (isSemanticConfigMismatch(s)) {
+          const retired = await retireDaemonForSemanticConfigChange(root, s);
+          if (!retired) return null;
+          spawnDetachedDaemon(root, this.semanticObjc);
+          continue;
+        }
         if (s) return s;
       }
       return null; // never bound — the proxy serves this session in-process
     };
     await runLocalHandshakeProxy({
       getDaemonSocket,
-      makeEngine: () => new MCPEngine({ semanticObjc: this.semanticObjc }),
+      // Keep plain daemon-fallback sessions watching files so they continue to
+      // auto-sync when the shared daemon is unavailable. Only Semantic ObjC
+      // watch configs disable the fallback watcher, preventing a degraded proxy
+      // from owning a duplicate IndexStore watcher alongside the daemon.
+      makeEngine: () => new MCPEngine({
+        watch: !expectedSemanticObjc.watchActive,
+        semanticObjc: this.semanticObjc,
+      }),
       root,
     });
   }

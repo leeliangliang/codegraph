@@ -22,6 +22,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Semantic ObjC enrichment no longer treats a quiet IndexStore directory as proof
+  that Xcode indexing is semantically complete. It now waits for stable helper
+  snapshots, rejects dumps that race with IndexStore writes, keeps the previous
+  stable graph usable while newer work is pending, and reports stable/pending
+  snapshot state in status output.
+- Semantic ObjC watch mode now backs off when Xcode's IndexStore snapshots keep timing out, cancels obsolete helper probes when new changes arrive, and includes snapshot capture times in status output so long-running indexing is easier to diagnose.
+- A semantic-enabled MCP launcher no longer attaches to an already-running
+  shared daemon that was started without Semantic ObjC watching. The daemon
+  handshake now carries the semantic watch config fingerprint, and launchers
+  restart incompatible daemons before proxying tool calls.
 - Editing a file no longer leaves stale dynamic-dispatch links in the graph: the quick git-based sync now refreshes synthesized call relationships (callbacks, event emitters, React re-render and JSX child links) the same way a full index does, so removed wiring disappears from `codegraph_explore` flows on the next sync instead of lingering until a re-index.
 - If the shared MCP daemon process dies mid-session, the session now transparently falls back to serving codegraph tools in-process instead of going silent — including answering a request that was already in flight when the daemon disconnected, which previously could hang the agent's tool call forever.
 - Objective-C and Swift dynamic dispatch now uses the compiler's call-site receiver information when available, so a call like `[faceTask initTask]` links to that receiver's implementation instead of fanning out to every unrelated override with the same selector.

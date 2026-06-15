@@ -15,6 +15,7 @@ import { createInterface } from 'node:readline';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { isXcRecord, type XcRecord } from './types';
+import { parseSemanticObjcSnapshotLine, type SemanticObjcSnapshotRecord } from './snapshot';
 
 export interface SpawnerOptions {
   /** Absolute path to the codegraph-xchelper binary. */
@@ -27,6 +28,8 @@ export interface SpawnerOptions {
   languages?: string[];
   /** Include SDK / system header occurrences. Default false. */
   includeSystem?: boolean;
+  /** Optional cancellation signal for short-lived helper probes. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -198,6 +201,62 @@ export function spawnHelper(opts: SpawnerOptions): SpawnerHandle {
       if (!child.killed) child.kill('SIGTERM');
     },
   };
+}
+
+export async function spawnSemanticObjcSnapshot(opts: SpawnerOptions): Promise<SemanticObjcSnapshotRecord> {
+  const capturedAtMs = Date.now();
+  const args = ['snapshot', '--source-root', opts.sourceRoot];
+  if (opts.storePath) {
+    args.push('--store-path', opts.storePath);
+  }
+  const langs = opts.languages ?? ['objc'];
+  if (langs.length > 0) {
+    args.push('--language', ...langs);
+  }
+  if (opts.includeSystem) {
+    args.push('--include-system');
+  }
+
+  const child: ChildProcess = spawn(opts.helperPath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const abort = () => {
+    if (!child.killed) child.kill('SIGTERM');
+  };
+  if (opts.signal?.aborted) abort();
+  opts.signal?.addEventListener('abort', abort, { once: true });
+
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  child.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(chunk.toString('utf8')));
+  child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk.toString('utf8')));
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', (err) => reject(err));
+      child.once('close', (code) => {
+        if (opts.signal?.aborted) {
+          reject(new Error('semantic-snapshot-wait-aborted'));
+          return;
+        }
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        const stderr = stderrChunks.join('').trim();
+        reject(new Error(`codegraph-xchelper snapshot exited with code ${code}${stderr ? `: ${stderr}` : ''}`));
+      });
+    });
+  } finally {
+    opts.signal?.removeEventListener('abort', abort);
+  }
+
+  for (const line of stdoutChunks.join('').split(/\r?\n/)) {
+    const parsed = parseSemanticObjcSnapshotLine(line.trim());
+    if (parsed) return parsed.capturedAtMs === undefined ? { ...parsed, capturedAtMs } : parsed;
+  }
+  throw new Error('codegraph-xchelper snapshot returned no valid semantic snapshot');
 }
 
 /**

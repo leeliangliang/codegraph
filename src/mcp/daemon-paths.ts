@@ -22,6 +22,7 @@ import * as crypto from 'crypto';
 import * as os from 'os';
 import * as path from 'path';
 import { getCodeGraphDir } from '../directory';
+import type { DaemonSemanticObjcConfigInfo } from './daemon-config';
 
 /** Soft upper bound for in-project socket paths. */
 const POSIX_SOCKET_PATH_LIMIT = 100;
@@ -36,20 +37,22 @@ function projectHash(projectRoot: string): string {
  * proxy should connect to) for `projectRoot`. Deterministic given a project
  * root, so independent processes converge without coordination.
  */
-export function getDaemonSocketPath(projectRoot: string): string {
+export function getDaemonSocketPath(projectRoot: string, semanticObjc?: DaemonSemanticObjcConfigInfo): string {
+  const suffix = semanticObjc?.watchActive ? `-${semanticObjc.fingerprint}` : '';
   if (process.platform === 'win32') {
-    return `\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`;
+    return `\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}${suffix}`;
   }
-  const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
+  const inProject = path.join(getCodeGraphDir(projectRoot), `daemon${suffix}.sock`);
   if (inProject.length <= POSIX_SOCKET_PATH_LIMIT) return inProject;
   // Long project paths (deep monorepos, Bazel out dirs) need tmpdir fallback
   // or `bind` returns EADDRINUSE / ENAMETOOLONG. Hash keeps it project-scoped.
-  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
+  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}${suffix}.sock`);
 }
 
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */
-export function getDaemonPidPath(projectRoot: string): string {
-  return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');
+export function getDaemonPidPath(projectRoot: string, semanticObjc?: DaemonSemanticObjcConfigInfo): string {
+  const suffix = semanticObjc?.watchActive ? `-${semanticObjc.fingerprint}` : '';
+  return path.join(getCodeGraphDir(projectRoot), `daemon${suffix}.pid`);
 }
 
 /** Structured contents of the pid lockfile. */
@@ -58,6 +61,7 @@ export interface DaemonLockInfo {
   version: string;
   socketPath: string;
   startedAt: number;
+  semanticObjc?: DaemonSemanticObjcConfigInfo;
 }
 
 /**
@@ -85,6 +89,18 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
       typeof parsed.socketPath === 'string' &&
       typeof parsed.startedAt === 'number'
     ) {
+      const semanticObjc = parsed.semanticObjc;
+      if (
+        semanticObjc !== undefined &&
+        (
+          !semanticObjc ||
+          typeof semanticObjc !== 'object' ||
+          typeof semanticObjc.fingerprint !== 'string' ||
+          typeof semanticObjc.watchActive !== 'boolean'
+        )
+      ) {
+        return null;
+      }
       return parsed as DaemonLockInfo;
     }
     return null;

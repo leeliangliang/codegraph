@@ -211,6 +211,22 @@ describe('semantic-objc mergeFromHelper — Phase A (sym → usr)', () => {
 });
 
 describe('semantic-objc mergeFromHelper — delta metadata persistence', () => {
+  it('uses temp tables for stale unit pruning instead of huge NOT IN parameter lists', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../src/extraction/semantic-objc/merger.ts'), 'utf8');
+
+    expect(source).toContain('CREATE TEMP TABLE IF NOT EXISTS semantic_objc_seen_units');
+    expect(source).toContain('CREATE TEMP TABLE IF NOT EXISTS semantic_objc_prunable_units');
+    expect(source).not.toContain('unit_id NOT IN (${seenPlaceholders})');
+    expect(source).not.toContain('unit_id IN (${prunablePlaceholders})');
+  });
+
+  it('applies delta rewrite inside the merge publication transaction', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../src/extraction/semantic-objc/merger.ts'), 'utf8');
+
+    expect(source).toContain('applySemanticObjcDeltaRewriteInTransaction');
+    expect(source).not.toContain('applySemanticObjcDeltaRewrite(db, plan)');
+  });
+
   it('persists unit, source membership, ownership rows, merge summary, and fresh state', async () => {
     seedNode('n1', 'class', 'MyVC', 'Sources/MyVC.m', 12);
 
@@ -295,6 +311,98 @@ describe('semantic-objc mergeFromHelper — delta metadata persistence', () => {
     `).run();
 
     const handle = recordSourceHandle(synth([
+      {
+        t: 'cap',
+        semanticDeltaVersion: 1,
+        helperVersion: 'helper-v2',
+        unitFingerprintAlgorithm: 'index-unit-v1',
+        recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+        sourceMembership: true,
+      },
+      { t: 'unit', unit_id: 'unit-1', fingerprint: 'fp-1', main_file: 'Sources/MyVC.m' },
+      { t: 'unit_file', unit_id: 'unit-1', file: 'Sources/MyVC.m', role: 'primary' },
+      { t: 'done', symbols: 0, refs: 0, rels: 0 },
+    ]));
+
+    await mergeFromHelper(conn.getDb(), handle, {
+      projectRoot: '/proj',
+      helperSourceRoot: '/proj',
+      publicationGate: async () => ({ stableSnapshotFingerprint: 'stable-fp' }),
+    });
+
+    expect(conn.getDb().prepare('SELECT unit_id FROM semantic_objc_units ORDER BY unit_id').all()).toEqual([
+      { unit_id: 'unit-1' },
+    ]);
+    expect(conn.getDb().prepare('SELECT unit_id, file_path, role FROM semantic_objc_unit_files ORDER BY unit_id, file_path').all()).toEqual([
+      { unit_id: 'unit-1', file_path: 'Sources/MyVC.m', role: 'primary' },
+    ]);
+  });
+
+  it('keeps stale unit metadata outside the current helper language scope', async () => {
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_units
+        (unit_id, fingerprint, fingerprint_algo, helper_version, last_seen_at, status)
+      VALUES
+        ('objc-stale', 'old-objc-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh'),
+        ('objc-current', 'old-objc-current-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh'),
+        ('swift-stale', 'old-swift-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh')
+    `).run();
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_unit_files (unit_id, file_path, role)
+      VALUES
+        ('objc-stale', 'Sources/OldVC.m', 'primary'),
+        ('objc-current', 'Sources/MyVC.m', 'primary'),
+        ('swift-stale', 'Sources/OldModel.swift', 'primary')
+    `).run();
+
+    const handle = recordSourceHandle(synth([
+      { t: 'meta', sourceRoot: '/proj', languageFilter: ['objc'], includeSystem: false },
+      {
+        t: 'cap',
+        semanticDeltaVersion: 1,
+        helperVersion: 'helper-v2',
+        unitFingerprintAlgorithm: 'index-unit-v1',
+        recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+        sourceMembership: true,
+      },
+      { t: 'unit', unit_id: 'objc-current', fingerprint: 'fp-1', main_file: 'Sources/MyVC.m' },
+      { t: 'unit_file', unit_id: 'objc-current', file: 'Sources/MyVC.m', role: 'primary' },
+      { t: 'done', symbols: 0, refs: 0, rels: 0 },
+    ]));
+
+    await mergeFromHelper(conn.getDb(), handle, {
+      projectRoot: '/proj',
+      helperSourceRoot: '/proj',
+      publicationGate: async () => ({ stableSnapshotFingerprint: 'stable-fp' }),
+    });
+
+    expect(conn.getDb().prepare('SELECT unit_id FROM semantic_objc_units ORDER BY unit_id').all()).toEqual([
+      { unit_id: 'objc-current' },
+      { unit_id: 'swift-stale' },
+    ]);
+    expect(conn.getDb().prepare('SELECT unit_id, file_path, role FROM semantic_objc_unit_files ORDER BY unit_id, file_path').all()).toEqual([
+      { unit_id: 'objc-current', file_path: 'Sources/MyVC.m', role: 'primary' },
+      { unit_id: 'swift-stale', file_path: 'Sources/OldModel.swift', role: 'primary' },
+    ]);
+  });
+
+  it('prunes removed units even when publication has no stable snapshot fingerprint', async () => {
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_units
+        (unit_id, fingerprint, fingerprint_algo, helper_version, last_seen_at, status)
+      VALUES
+        ('old-unit', 'old-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh'),
+        ('unit-1', 'old-unit-1-fp', 'index-unit-v1', 'helper-v1', 1, 'fresh')
+    `).run();
+    conn.getDb().prepare(`
+      INSERT INTO semantic_objc_unit_files (unit_id, file_path, role)
+      VALUES
+        ('old-unit', 'Sources/OldVC.m', 'primary'),
+        ('unit-1', 'Sources/OldHeader.h', 'header')
+    `).run();
+
+    const handle = recordSourceHandle(synth([
+      { t: 'meta', sourceRoot: '/proj', languageFilter: ['objc'], includeSystem: false },
       {
         t: 'cap',
         semanticDeltaVersion: 1,

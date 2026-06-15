@@ -51,7 +51,6 @@ struct Queries {
         var relCount = 0
         var seenUSRs = Set<String>()
         seenUSRs.reserveCapacity(names.count)
-        var indexedFiles = Set<String>()
 
         for name in names {
             // Drain per-name: occurrence iteration bridges ObjC/CF temporaries
@@ -72,7 +71,6 @@ struct Queries {
                     if seenUSRs.contains(usr) { continue }
                     seenUSRs.insert(usr)
 
-                    indexedFiles.insert(occ.location.path)
                     emitSym(occ)
                     symCount += 1
 
@@ -80,7 +78,6 @@ struct Queries {
                     // nested IndexStoreDB queries, so it remains LMDB-safe.
                     db.forEachSymbolOccurrence(byUSR: usr, roles: .all) { ref in
                         if !includeSystem && ref.location.isSystem { return true }
-                        indexedFiles.insert(ref.location.path)
                         let isDecl = ref.roles.contains(.declaration)
                         let isDef = ref.roles.contains(.definition)
                         let isDeclOrDef = isDecl || isDef
@@ -110,9 +107,62 @@ struct Queries {
             }
         }
 
-        emitUnitMembership(for: indexedFiles)
+        emitUnitMembership(for: Set(collectSnapshotSourceFiles()))
         emitDone(symbols: symCount, refs: refCount, rels: relCount)
         return (symCount, refCount, relCount)
+    }
+
+    /// Emit a compact readiness snapshot. This intentionally avoids
+    /// symbol/reference/relation occurrence walks; it only summarizes the
+    /// current primary-source unit membership and unit fingerprints.
+    func snapshot(explicitOutputUnits: Bool, expectedUnitCount: Int? = nil) throws {
+        var unitFiles: [String: Set<String>] = [:]
+        for file in collectSnapshotSourceFiles() {
+            autoreleasepool {
+                db.forEachUnitNameContainingFile(path: file) { unitName in
+                    unitFiles[unitName, default: []].insert(file)
+                    return true
+                }
+            } as Void
+        }
+
+        var unitFileCount = 0
+        var sourceMembershipCount = 0
+        var parts: [String] = []
+        for unitName in unitFiles.keys.sorted() {
+            autoreleasepool {
+                let files = Array(unitFiles[unitName] ?? []).sorted()
+                let unitFingerprint = fingerprint(unitName: unitName, files: files)
+                parts.append(unitName)
+                parts.append(unitFingerprint)
+                for file in files {
+                    unitFileCount += 1
+                    parts.append("\(relativize(file)):\(unitFileRole(file))")
+                }
+                if files.contains(where: isPrimarySourceFile) {
+                    sourceMembershipCount += 1
+                }
+            }
+        }
+
+        let unitCount = max(unitFiles.count, expectedUnitCount ?? 0)
+
+        write([
+            "t": "snapshot",
+            "capturedAtMs": Int64(Date().timeIntervalSince1970 * 1000),
+            "helperVersion": "codegraph-xchelper 1.1.1",
+            "semanticDeltaVersion": 1,
+            "unitFingerprintAlgorithm": "index-unit-v1",
+            "recordKinds": ["unit", "unit_file", "sym", "rel", "ref", "inc", "dcl"],
+            "sourceMembership": true,
+            "languageFilter": Array(languageFilter.map(languageName)),
+            "includeSystem": includeSystem,
+            "explicitOutputUnits": explicitOutputUnits,
+            "unitCount": unitCount,
+            "unitFileCount": unitFileCount,
+            "sourceMembershipCount": sourceMembershipCount,
+            "aggregateFingerprint": String(format: "%016llx", fnv1a64(parts.joined(separator: "\u{0}"))),
+        ])
     }
 
     // MARK: - Filters
@@ -234,6 +284,47 @@ struct Queries {
             ])
             return true
         }
+    }
+
+    private func collectSnapshotSourceFiles() -> [String] {
+        let root = URL(fileURLWithPath: sourceRoot)
+        let sourceExts = snapshotSourceExtensions()
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+
+        var files: [String] = []
+        for case let url as URL in enumerator {
+            let ext = url.pathExtension.lowercased()
+            guard sourceExts.contains(ext) else { continue }
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            files.append(url.resolvingSymlinksInPath().standardized.path)
+        }
+        return files.sorted()
+    }
+
+    private func snapshotSourceExtensions() -> Set<String> {
+        if languageFilter.isEmpty { return primarySourceFileExtensions }
+        var exts = Set<String>()
+        if languageFilter.contains(.objc) {
+            exts.insert("m")
+            exts.insert("mm")
+        }
+        if languageFilter.contains(.c) {
+            exts.insert("c")
+        }
+        if languageFilter.contains(.cxx) {
+            exts.insert("cc")
+            exts.insert("cpp")
+            exts.insert("cxx")
+            exts.insert("mm")
+        }
+        if languageFilter.contains(.swift) {
+            exts.insert("swift")
+        }
+        return exts
     }
 
     /// Symlink-robust "is this path inside the source root?" check. macOS keeps

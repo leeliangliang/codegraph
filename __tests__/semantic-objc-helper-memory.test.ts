@@ -18,6 +18,8 @@ const supportPath = path.resolve(
   __dirname,
   '../src/extraction/semantic-objc/swift/Sources/CodegraphXchelperSupport/CodegraphXchelperSupport.cpp'
 );
+const rootPackagePath = path.resolve(__dirname, '../package.json');
+const helperPackagePath = path.resolve(__dirname, '../packages/mac-objc-enricher/package.json');
 
 describe('codegraph-xchelper memory profile', () => {
   it('streams IndexStoreDB dump queries instead of materializing occurrence arrays', () => {
@@ -105,6 +107,46 @@ describe('codegraph-xchelper memory profile', () => {
     expect(source).toContain('let membershipPaths = paths.filter(isPrimarySourceFile)');
     expect(source).toContain('for file in membershipPaths');
     expect(source).not.toContain('for file in paths {\n            db.forEachUnitNameContainingFile(path: file)');
+  });
+
+  it('emits dump unit membership from the same primary-source scan used by snapshots', () => {
+    const source = fs.readFileSync(queriesPath, 'utf8');
+
+    expect(source).toContain('emitUnitMembership(for: Set(collectSnapshotSourceFiles()))');
+    expect(source).not.toContain('emitUnitMembership(for: indexedFiles)');
+  });
+
+  it('adds a snapshot helper mode that avoids full symbol/reference walks', () => {
+    const mainSource = fs.readFileSync(mainPath, 'utf8');
+    const queriesSource = fs.readFileSync(queriesPath, 'utf8');
+
+    expect(mainSource).toContain('subcommands: [Discover.self, Dump.self, Snapshot.self, Status.self]');
+    expect(queriesSource).toContain('func snapshot(explicitOutputUnits: Bool');
+    expect(queriesSource).toContain('"t": "snapshot"');
+    expect(queriesSource).toContain('aggregateFingerprint');
+    expect(queriesSource).toContain('sourceMembershipCount');
+    expect(queriesSource).not.toContain('"sourceMembershipCount": unitFiles.count');
+    expect(queriesSource).not.toMatch(/func snapshot[\s\S]*?forEachSymbolOccurrence/);
+    expect(queriesSource).not.toMatch(/func snapshot[\s\S]*?forEachCanonicalSymbolOccurrence/);
+  });
+
+  it('removes the temporary IndexStoreDB database used by snapshot helper mode', () => {
+    const source = fs.readFileSync(mainPath, 'utf8');
+
+    expect(source).toContain('let tmpDB = NSTemporaryDirectory() + "codegraph-xchelper-snapshot-db-');
+    expect(source).toContain('defer {\n            try? FileManager.default.removeItem(atPath: tmpDB)\n        }');
+  });
+
+  it('requires a snapshot-capable optional helper package', () => {
+    const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as {
+      optionalDependencies?: Record<string, string>;
+      version: string;
+    };
+    const helperPackage = JSON.parse(fs.readFileSync(helperPackagePath, 'utf8')) as { version: string };
+    const dep = rootPackage.optionalDependencies?.['@colbymchenry/codegraph-mac-objc-enricher'];
+
+    expect(helperPackage.version).toBe(rootPackage.version);
+    expect(dep).toBe(`^${helperPackage.version}`);
   });
 
   it('matches project-root paths on directory boundaries only', () => {

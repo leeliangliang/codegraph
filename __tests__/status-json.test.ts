@@ -14,7 +14,13 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
-import { markSemanticObjcFailed, markSemanticObjcMergeCompleted, markSemanticObjcStale } from '../src/extraction/semantic-objc';
+import {
+  markSemanticObjcFailed,
+  markSemanticObjcMergeCompleted,
+  markSemanticObjcQueued,
+  markSemanticObjcStale,
+  setSemanticObjcStateValue,
+} from '../src/extraction/semantic-objc';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const PKG_VERSION = JSON.parse(
@@ -102,8 +108,14 @@ describe('codegraph status --json — CI fields (#329)', () => {
     fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
     fs.writeFileSync(helperPath, [
       '#!/bin/sh',
+      'if [ "$1" = "snapshot" ]; then',
+      '  printf \'%s\\n\' \'{"t":"snapshot","helperVersion":"test","semanticDeltaVersion":1,"unitFingerprintAlgorithm":"index-unit-v1","recordKinds":["unit","unit_file","sym","rel","ref"],"sourceMembership":true,"languageFilter":["objc"],"includeSystem":false,"explicitOutputUnits":false,"unitCount":1,"unitFileCount":1,"sourceMembershipCount":1,"aggregateFingerprint":"stable"}\'',
+      '  exit 0',
+      'fi',
       'printf \'%s\\n\' \'{"t":"meta","sourceRoot":"/tmp","languageFilter":["objc"],"includeSystem":false}\'',
       'printf \'%s\\n\' \'{"t":"cap","semanticDeltaVersion":1,"helperVersion":"test","unitFingerprintAlgorithm":"index-unit-v1","recordKinds":["unit","unit_file","sym","rel","ref"],"sourceMembership":true}\'',
+      'printf \'%s\\n\' \'{"t":"unit","unit_id":"unit-1","fingerprint":"fp-1","main_file":"a.ts"}\'',
+      'printf \'%s\\n\' \'{"t":"unit_file","unit_id":"unit-1","file":"a.ts","role":"primary"}\'',
       'printf \'%s\\n\' \'{"t":"done","symbols":0,"refs":0,"rels":0}\'',
     ].join('\n') + '\n');
     fs.chmodSync(helperPath, 0o755);
@@ -121,7 +133,7 @@ describe('codegraph status --json — CI fields (#329)', () => {
     expect(semanticObjc.lastMergeSummary).toMatchObject({
       symsSeen: 0,
       refsSeen: 0,
-      unitsSeen: 0,
+      unitsSeen: 1,
     });
   });
 
@@ -156,6 +168,13 @@ describe('codegraph status --json — CI fields (#329)', () => {
         refsNonCall: 0,
       }, 1234);
       markSemanticObjcStale(conn.getDb(), 'database locked by another process', 1235);
+      setSemanticObjcStateValue(conn.getDb(), 'last_success_snapshot_fingerprint', 'stable-fp', 1234);
+      setSemanticObjcStateValue(conn.getDb(), 'last_success_snapshot_captured_at', '1233', 1234);
+      setSemanticObjcStateValue(conn.getDb(), 'pending_snapshot_fingerprint', 'pending-fp', 1236);
+      setSemanticObjcStateValue(conn.getDb(), 'pending_snapshot_captured_at', '1236', 1236);
+      setSemanticObjcStateValue(conn.getDb(), 'pending_reason', 'semantic-snapshot-race', 1236);
+      setSemanticObjcStateValue(conn.getDb(), 'last_stability_wait_started_at', '1236', 1236);
+      setSemanticObjcStateValue(conn.getDb(), 'last_snapshot_race_at', '1237', 1237);
     } finally {
       conn.close();
     }
@@ -177,11 +196,46 @@ describe('codegraph status --json — CI fields (#329)', () => {
       unitFiles: 0,
       ownershipRows: 0,
     });
+    expect(semanticObjc.snapshot).toMatchObject({
+      lastSuccessFingerprint: 'stable-fp',
+      lastSuccessCapturedAt: 1233,
+      pendingFingerprint: 'pending-fp',
+      pendingCapturedAt: 1236,
+      pendingReason: 'semantic-snapshot-race',
+      lastStabilityWaitStartedAt: 1236,
+      lastSnapshotRaceAt: 1237,
+    });
     expect((semanticObjc.diagnostics as Array<{ code: string }>).map((diag) => diag.code)).toEqual(expect.arrayContaining([
       'semantic-objc-helper-no-units',
       'semantic-objc-symbols-not-matching',
       'semantic-objc-refs-no-target-high',
       'semantic-objc-lock-failure',
+      'semantic-objc-pending-newer-indexstore',
+      'semantic-objc-snapshot-race',
+    ]));
+  });
+
+  it('status --json reports not-ready Semantic ObjC snapshots as a distinct diagnostic', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    const conn = DatabaseConnection.open(getDatabasePath(tempDir));
+    try {
+      markSemanticObjcQueued(conn.getDb(), 'semantic-snapshot-not-ready:snapshot-missing-units', 1235);
+      setSemanticObjcStateValue(conn.getDb(), 'last_success_snapshot_fingerprint', 'stable-fp', 1234);
+      setSemanticObjcStateValue(conn.getDb(), 'pending_snapshot_fingerprint', 'pending-fp', 1236);
+      setSemanticObjcStateValue(conn.getDb(), 'pending_reason', 'semantic-snapshot-not-ready:snapshot-missing-units', 1236);
+    } finally {
+      conn.close();
+    }
+
+    const out = runStatusJson(tempDir);
+    const semanticObjc = out.semanticObjc as Record<string, any>;
+    expect((semanticObjc.diagnostics as Array<{ code: string }>).map((diag) => diag.code)).toEqual(expect.arrayContaining([
+      'semantic-objc-pending-newer-indexstore',
+      'semantic-objc-snapshot-not-ready',
     ]));
   });
 

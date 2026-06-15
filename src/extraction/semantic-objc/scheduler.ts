@@ -6,6 +6,7 @@ export interface SemanticObjcIdleSchedulerOptions {
   lockPath?: string;
   isIdle?: () => boolean;
   onState?: (status: SemanticObjcStatus, reason?: string) => void;
+  handleJobError?: (err: unknown) => SemanticObjcJobResult | undefined;
   retryDelaysMs?: number[];
 }
 
@@ -87,44 +88,49 @@ export class SemanticObjcIdleScheduler {
     this.running = true;
     this.opts.onState?.('running');
     try {
-      if (this.opts.lockPath) {
-        const lock = new FileLock(this.opts.lockPath);
-        try {
-          await lock.withLockAsync(job);
-        } catch (err) {
-          if (isRetryableSemanticObjcLockError(err)) {
-            this.queued = true;
-            this.opts.onState?.('queued', 'graph-lock-busy');
-            this.scheduleRetry();
-            return { ran: false, reason: 'graph-lock-busy' };
-          }
-          throw err;
-        }
-      } else {
-        try {
-          await job();
-        } catch (err) {
-          if (isRetryableSemanticObjcLockError(err)) {
-            this.queued = true;
-            this.opts.onState?.('queued', 'graph-lock-busy');
-            this.scheduleRetry();
-            return { ran: false, reason: 'graph-lock-busy' };
-          }
-          throw err;
-        }
-      }
+      await this.runJob(job);
       if (this.pendingJob === job) {
         this.pendingJob = null;
         this.retryAttempt = 0;
         this.opts.onState?.('fresh');
       }
       return { ran: true };
+    } catch (err) {
+      const handled = this.handleJobError(err, job);
+      if (handled) return handled;
+      throw err;
     } finally {
       this.running = false;
       if (this.queued && this.pendingJob) {
         this.scheduleRetry();
       }
     }
+  }
+
+  private async runJob(job: () => Promise<void>): Promise<void> {
+    if (this.opts.lockPath) {
+      const lock = new FileLock(this.opts.lockPath);
+      await lock.withLockAsync(job);
+      return;
+    }
+    await job();
+  }
+
+  private handleJobError(err: unknown, job: () => Promise<void>): SemanticObjcJobResult | null {
+    if (isRetryableSemanticObjcLockError(err)) {
+      this.queued = true;
+      this.opts.onState?.('queued', 'graph-lock-busy');
+      this.scheduleRetry();
+      return { ran: false, reason: 'graph-lock-busy' };
+    }
+
+    const handled = this.opts.handleJobError?.(err);
+    if (!handled) return null;
+    if (this.pendingJob === job) {
+      this.pendingJob = null;
+      this.retryAttempt = 0;
+    }
+    return handled;
   }
 
   private scheduleRetry(): void {

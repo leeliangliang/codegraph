@@ -54,6 +54,10 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
+import {
+  describeDaemonSemanticObjcConfig,
+  type DaemonSemanticObjcConfigInfo,
+} from './daemon-config';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -72,6 +76,7 @@ export interface DaemonHello {
   pid: number;       // daemon pid (informational; for `ps` debugging)
   socketPath: string; // echoed back so the proxy can log it
   protocol: 1;       // bump if the hello shape changes
+  semanticObjc?: DaemonSemanticObjcConfigInfo; // daemon-side watch compatibility metadata
 }
 
 export interface DaemonStartResult {
@@ -101,13 +106,15 @@ export class Daemon {
   private stopping = false;
   private socketPath: string;
   private pidPath: string;
+  private semanticObjcConfig: DaemonSemanticObjcConfigInfo;
 
   constructor(
     private projectRoot: string,
     opts: { idleTimeoutMs?: number; semanticObjc?: unknown } = {},
   ) {
-    this.socketPath = getDaemonSocketPath(projectRoot);
-    this.pidPath = getDaemonPidPath(projectRoot);
+    this.semanticObjcConfig = describeDaemonSemanticObjcConfig(opts.semanticObjc);
+    this.socketPath = getDaemonSocketPath(projectRoot, this.semanticObjcConfig);
+    this.pidPath = getDaemonPidPath(projectRoot, this.semanticObjcConfig);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.engine = new MCPEngine({ semanticObjc: opts.semanticObjc });
     this.engine.setProjectPathHint(projectRoot);
@@ -151,6 +158,7 @@ export class Daemon {
       version: CodeGraphPackageVersion,
       socketPath: this.socketPath,
       startedAt: Date.now(),
+      semanticObjc: this.semanticObjcConfig,
     };
 
     process.stderr.write(
@@ -211,6 +219,7 @@ export class Daemon {
       pid: process.pid,
       socketPath: this.socketPath,
       protocol: 1,
+      semanticObjc: this.semanticObjcConfig,
     };
     socket.write(JSON.stringify(hello) + '\n');
 
@@ -303,8 +312,9 @@ export type AcquireResult =
  * Whoever links first wins; everyone else gets EEXIST and reads a complete file.
  * There is no empty-file window at all.
  */
-export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
-  const pidPath = getDaemonPidPath(projectRoot);
+export function tryAcquireDaemonLock(projectRoot: string, opts: { semanticObjc?: unknown } = {}): AcquireResult {
+  const semanticObjc = describeDaemonSemanticObjcConfig(opts.semanticObjc);
+  const pidPath = getDaemonPidPath(projectRoot, semanticObjc);
   // Make sure the .codegraph/ directory exists — the daemon may be the first
   // thing to touch it on a fresh-clone-but-already-initialized checkout.
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
@@ -312,8 +322,9 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   const info: DaemonLockInfo = {
     pid: process.pid,
     version: CodeGraphPackageVersion,
-    socketPath: getDaemonSocketPath(projectRoot),
+    socketPath: getDaemonSocketPath(projectRoot, semanticObjc),
     startedAt: Date.now(),
+    semanticObjc,
   };
 
   // Temp name is pid-scoped so racing candidates never collide on it.

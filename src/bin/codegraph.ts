@@ -832,6 +832,20 @@ program
       if (semanticObjc.staleReason) {
         console.log(`    Stale reason: ${semanticObjc.staleReason}`);
       }
+      if (semanticObjc.snapshot?.lastSuccessFingerprint) {
+        const captured = semanticObjc.snapshot.lastSuccessCapturedAt
+          ? `, captured ${new Date(semanticObjc.snapshot.lastSuccessCapturedAt).toISOString()}`
+          : '';
+        console.log(`    Stable snap:  ${semanticObjc.snapshot.lastSuccessFingerprint}${captured}`);
+      }
+      if (semanticObjc.snapshot?.pendingFingerprint || semanticObjc.snapshot?.pendingReason) {
+        const pending = [
+          semanticObjc.snapshot.pendingFingerprint ? `fingerprint ${semanticObjc.snapshot.pendingFingerprint}` : null,
+          semanticObjc.snapshot.pendingCapturedAt ? `captured ${new Date(semanticObjc.snapshot.pendingCapturedAt).toISOString()}` : null,
+          semanticObjc.snapshot.pendingReason ? `reason ${semanticObjc.snapshot.pendingReason}` : null,
+        ].filter(Boolean).join(', ');
+        console.log(`    Pending snap: ${pending}`);
+      }
       if (semanticObjc.coverage) {
         console.log(
           `    Coverage:     ${formatNumber(semanticObjc.coverage.nodesWithUsr)} nodes with USR, ` +
@@ -1866,6 +1880,7 @@ program
         enrichWithIndexStore,
         inferSemanticObjcSourceRoot,
         isRetryableSemanticObjcLockError,
+        isSemanticObjcSnapshotPublicationGateError,
         locateHelperBinary,
         markSemanticObjcFailed,
         markSemanticObjcQueued,
@@ -1911,6 +1926,8 @@ program
           } catch (err) {
             if (isRetryableSemanticObjcLockError(err)) {
               markSemanticObjcQueued(conn.getDb(), 'graph-lock-busy');
+            } else if (isSemanticObjcSnapshotPublicationGateError(err)) {
+              // enrichWithIndexStore already persisted the queued snapshot state.
             } else {
               markSemanticObjcFailed(conn.getDb(), `semantic-enrichment-failed:${err instanceof Error ? err.message : String(err)}`);
             }

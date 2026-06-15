@@ -54,6 +54,16 @@ export interface SemanticObjcDiagnostic {
   message: string;
 }
 
+export interface SemanticObjcSnapshotState {
+  lastSuccessFingerprint?: string;
+  lastSuccessCapturedAt?: number;
+  pendingFingerprint?: string;
+  pendingCapturedAt?: number;
+  pendingReason?: string;
+  lastStabilityWaitStartedAt?: number;
+  lastSnapshotRaceAt?: number;
+}
+
 export interface SemanticObjcStateSnapshot {
   status?: SemanticObjcStatus;
   reason?: string;
@@ -64,6 +74,7 @@ export interface SemanticObjcStateSnapshot {
   lastFailureAt?: number;
   lastMergeCompletedAt?: number;
   lastMergeSummary?: SemanticObjcMergeSummarySnapshot;
+  snapshot?: SemanticObjcSnapshotState;
   coverage?: SemanticObjcCoverageSnapshot;
   diagnostics?: SemanticObjcDiagnostic[];
 }
@@ -117,6 +128,9 @@ export function markSemanticObjcStale(
 export function markSemanticObjcFresh(db: SqliteDatabase, now = Date.now()): void {
   updateSemanticObjcState(db, 'fresh', undefined, now);
   setSemanticObjcStateValue(db, 'stale_reason', '', now);
+  setSemanticObjcStateValue(db, 'pending_snapshot_fingerprint', '', now);
+  setSemanticObjcStateValue(db, 'pending_snapshot_captured_at', '', now);
+  setSemanticObjcStateValue(db, 'pending_reason', '', now);
   setSemanticObjcStateValue(db, 'last_success_at', String(now), now);
 }
 
@@ -131,6 +145,9 @@ export function markSemanticObjcMergeCompleted(
 
 export function markSemanticObjcQueued(db: SqliteDatabase, reason: string, now = Date.now()): void {
   updateSemanticObjcState(db, 'queued', reason, now);
+  if (reason === 'semantic-snapshot-wait') {
+    setSemanticObjcStateValue(db, 'last_stability_wait_started_at', String(now), now);
+  }
 }
 
 export function markSemanticObjcRunning(db: SqliteDatabase, reason = 'semantic-enrichment', now = Date.now()): void {
@@ -158,6 +175,7 @@ export function getSemanticObjcState(db: SqliteDatabase): SemanticObjcStateSnaps
   const values = new Map(rows.map((row) => [row.key, row.value]));
   const lastMergeSummary = jsonValue<SemanticObjcMergeSummarySnapshot>(values.get('last_merge_summary_json'));
   const coverage = getSemanticObjcCoverage(db);
+  const semanticSnapshot = semanticObjcSnapshotState(values);
   const snapshot: SemanticObjcStateSnapshot = {
     status: values.get('status') as SemanticObjcStatus | undefined,
     reason: values.get('reason') || undefined,
@@ -168,6 +186,7 @@ export function getSemanticObjcState(db: SqliteDatabase): SemanticObjcStateSnaps
     lastFailureAt: numberValue(values.get('last_failure_at')),
     lastMergeCompletedAt: numberValue(values.get('last_merge_completed_at')),
     lastMergeSummary,
+    snapshot: semanticSnapshot,
     coverage,
   };
   snapshot.diagnostics = getSemanticObjcDiagnostics(snapshot, coverage);
@@ -240,7 +259,46 @@ export function getSemanticObjcDiagnostics(
       message: 'Last Semantic ObjC attempt failed due to a DB or graph lock. Retry when the graph is idle, or rerun semantic enrichment if no daemon is active.',
     });
   }
+  if (snapshot.snapshot?.pendingFingerprint || snapshot.snapshot?.pendingReason) {
+    diagnostics.push({
+      code: 'semantic-objc-pending-newer-indexstore',
+      severity: 'info',
+      message: 'A newer IndexStore snapshot is pending. The last successful Semantic ObjC graph remains usable until the newer snapshot is stable and published.',
+    });
+  }
+  if (snapshot.snapshot?.pendingReason === 'semantic-snapshot-race' || snapshot.reason === 'semantic-snapshot-race') {
+    diagnostics.push({
+      code: 'semantic-objc-snapshot-race',
+      severity: 'warning',
+      message: 'The last Semantic ObjC dump raced with Xcode IndexStore writes and was discarded before publishing.',
+    });
+  }
+  if (isSemanticObjcSnapshotNotReadyReason(snapshot.snapshot?.pendingReason) ||
+    isSemanticObjcSnapshotNotReadyReason(snapshot.reason)) {
+    diagnostics.push({
+      code: 'semantic-objc-snapshot-not-ready',
+      severity: 'warning',
+      message: 'The latest Semantic ObjC snapshot is not ready for publication. The previous stable graph remains usable while IndexStore data stabilizes.',
+    });
+  }
   return diagnostics;
+}
+
+function isSemanticObjcSnapshotNotReadyReason(reason: string | undefined): boolean {
+  return reason?.startsWith('semantic-snapshot-not-ready:') ?? false;
+}
+
+function semanticObjcSnapshotState(values: Map<string, string>): SemanticObjcSnapshotState | undefined {
+  const snapshot: SemanticObjcSnapshotState = {
+    lastSuccessFingerprint: stringValue(values.get('last_success_snapshot_fingerprint')),
+    lastSuccessCapturedAt: numberValue(values.get('last_success_snapshot_captured_at')),
+    pendingFingerprint: stringValue(values.get('pending_snapshot_fingerprint')),
+    pendingCapturedAt: numberValue(values.get('pending_snapshot_captured_at')),
+    pendingReason: stringValue(values.get('pending_reason')),
+    lastStabilityWaitStartedAt: numberValue(values.get('last_stability_wait_started_at')),
+    lastSnapshotRaceAt: numberValue(values.get('last_snapshot_race_at')),
+  };
+  return Object.values(snapshot).some((value) => value !== undefined) ? snapshot : undefined;
 }
 
 function countRows(db: SqliteDatabase, sql: string): number {
@@ -252,6 +310,10 @@ function numberValue(value: string | undefined): number | undefined {
   if (value === undefined || value === '') return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function stringValue(value: string | undefined): string | undefined {
+  return value === undefined || value === '' ? undefined : value;
 }
 
 function jsonValue<T>(value: string | undefined): T | undefined {

@@ -40,6 +40,7 @@ import type {
   XcCapabilityRecord,
   XcDeclRecord,
   XcIncludeRecord,
+  XcMetaRecord,
   XcRecord,
   XcRefRecord,
   XcRelRecord,
@@ -47,9 +48,9 @@ import type {
   XcUnitFileRecord,
   XcUnitRecord,
 } from './types';
-import { markSemanticObjcFresh, markSemanticObjcMergeCompleted } from './state';
-import { planSemanticObjcDelta, type StoredSemanticObjcUnit } from './delta';
-import { applySemanticObjcDeltaRewrite } from './rewrite';
+import { markSemanticObjcFresh, markSemanticObjcMergeCompleted, setSemanticObjcStateValue } from './state';
+import { planSemanticObjcDelta, type SemanticObjcDeltaPlan, type StoredSemanticObjcUnit } from './delta';
+import { applySemanticObjcDeltaRewriteInTransaction } from './rewrite';
 
 /**
  * Realpath a path, returning the original on failure. macOS reports file paths
@@ -149,11 +150,20 @@ function mergeDecorators(
   return changed;
 }
 
+export interface MergePublicationGateResult {
+  stableSnapshotFingerprint?: string;
+  stableSnapshotCapturedAt?: number;
+}
+
 export interface MergeOptions {
   /** The CodeGraph project root — what `nodes.file_path` is relative to. */
   projectRoot: string;
   /** What the helper used as `--source-root` — what `sym.file` is relative to. */
   helperSourceRoot: string;
+  /** Stable snapshot fingerprint captured by the publication gate. */
+  stableSnapshotFingerprint?: string;
+  /** Hook invoked after the helper stream fully drains but before DB writes begin. */
+  publicationGate?: () => Promise<MergePublicationGateResult>;
 }
 
 export interface MergeSummary {
@@ -363,10 +373,14 @@ export async function mergeFromHelper(
   const unitFileBuffer: XcUnitFileRecord[] = [];
   const includeBuffer: XcIncludeRecord[] = [];
   const declBuffer: XcDeclRecord[] = [];
+  let metaRecord: XcMetaRecord | null = null;
   let capRecord: XcCapabilityRecord | null = null;
 
   for await (const record of handle.records()) {
     switch ((record as XcRecord).t) {
+      case 'meta':
+        metaRecord = record as XcMetaRecord;
+        break;
       case 'cap':
         capRecord = record as XcCapabilityRecord;
         break;
@@ -409,24 +423,34 @@ export async function mergeFromHelper(
 
   await handle.wait();
 
+  const publicationGateResult = opts.publicationGate ? await opts.publicationGate() : {};
+  const stableSnapshotFingerprint = publicationGateResult.stableSnapshotFingerprint ?? opts.stableSnapshotFingerprint;
+  const stableSnapshotCapturedAt = publicationGateResult.stableSnapshotCapturedAt;
   const deltaUnitFiles = canonicaliseUnitFiles(unitFileBuffer, helperRoot, projectRoot);
   let deltaSafe = false;
+  let deltaPlan: SemanticObjcDeltaPlan | null = null;
   if (capRecord) {
-    const plan = planSemanticObjcDelta({
+    const plannedDelta = planSemanticObjcDelta({
       capability: capRecord,
       currentUnits: unitBuffer,
       currentUnitFiles: deltaUnitFiles,
       storedUnits: loadStoredSemanticObjcUnits(db),
       uncertainOwnership: hasAmbiguousPrimaryOwnership(deltaUnitFiles),
     });
-    const rewrite = applySemanticObjcDeltaRewrite(db, plan);
-    deltaSafe = rewrite.mode === 'rewritten';
+    deltaPlan = plannedDelta;
   }
 
   const matchedSyms: Array<{ nodeId: string; filePath: string; usr: string }> = [];
 
   db.exec('BEGIN');
   try {
+    if (deltaPlan) {
+      const rewrite = applySemanticObjcDeltaRewriteInTransaction(db, deltaPlan, Date.now(), {
+        updateState: false,
+      });
+      deltaSafe = rewrite.mode === 'rewritten';
+    }
+
     for (const sym of symBuffer) {
       const filePath = canonicaliseSymPath(sym.file, helperRoot, projectRoot);
       if (filePath === null) {
@@ -478,13 +502,11 @@ export async function mergeFromHelper(
         seenUnits.add(unit.unit_id);
         summary.unitsMerged++;
       }
-      // CONTRACT: the helper emits the FULL current unit set every run — the
-      // delta planner's removedUnitIds detection relies on the same invariant.
-      // A partial dump here would wrongly prune surviving units' rows. This
-      // also means the language set must stay stable across runs for one
-      // project: a dump made with `--language objc` prunes units that were
-      // recorded from an earlier `--language objc swift` run.
-      pruneStaleSemanticObjcUnits(db, seenUnits);
+      // CONTRACT: the helper emits the full current unit set for the requested
+      // language scope. Prune only stale units in that same scope so manual
+      // one-shot runs and the MCP watcher can use different language filters
+      // without deleting each other's unit metadata.
+      pruneStaleSemanticObjcUnits(db, seenUnits, metaRecord?.languageFilter ?? []);
       for (const unitId of seenUnits) {
         deleteUnitFilesStmt.run(unitId);
       }
@@ -805,7 +827,24 @@ export async function mergeFromHelper(
       includeEdgesMerged: summary.includeEdgesMerged,
       declEdgesMerged: summary.declEdgesMerged,
     });
-    markSemanticObjcFresh(db);
+    const publishedAt = Date.now();
+    if (stableSnapshotFingerprint) {
+      setSemanticObjcStateValue(
+        db,
+        'last_success_snapshot_fingerprint',
+        stableSnapshotFingerprint,
+        publishedAt
+      );
+    }
+    if (stableSnapshotCapturedAt !== undefined) {
+      setSemanticObjcStateValue(
+        db,
+        'last_success_snapshot_captured_at',
+        String(stableSnapshotCapturedAt),
+        publishedAt
+      );
+    }
+    markSemanticObjcFresh(db, publishedAt);
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
@@ -814,6 +853,7 @@ export async function mergeFromHelper(
 
   return summary;
 }
+
 
 /**
  * Normalise a path emitted by the Swift helper into the form CodeGraph's
@@ -882,13 +922,116 @@ function loadStoredSemanticObjcUnits(db: SqliteDatabase): StoredSemanticObjcUnit
   }));
 }
 
-function pruneStaleSemanticObjcUnits(db: SqliteDatabase, seenUnits: Set<string>): void {
+function pruneStaleSemanticObjcUnits(db: SqliteDatabase, seenUnits: Set<string>, languageFilter: string[]): void {
   if (seenUnits.size === 0) return;
-  const unitIds = [...seenUnits];
-  const placeholders = unitIds.map(() => '?').join(', ');
-  db.prepare(`DELETE FROM semantic_objc_unit_files WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
-  db.prepare(`DELETE FROM semantic_objc_node_ownership WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
-  db.prepare(`DELETE FROM semantic_objc_units WHERE unit_id NOT IN (${placeholders})`).run(...unitIds);
+  db.exec(`
+    CREATE TEMP TABLE IF NOT EXISTS semantic_objc_seen_units (
+      unit_id TEXT PRIMARY KEY
+    );
+    CREATE TEMP TABLE IF NOT EXISTS semantic_objc_prunable_units (
+      unit_id TEXT PRIMARY KEY
+    );
+    DELETE FROM semantic_objc_seen_units;
+    DELETE FROM semantic_objc_prunable_units;
+  `);
+
+  const insertSeenUnit = db.prepare('INSERT OR IGNORE INTO semantic_objc_seen_units (unit_id) VALUES (?)');
+  for (const unitId of seenUnits) {
+    insertSeenUnit.run(unitId);
+  }
+  const prunableCount = populatePrunableSemanticObjcUnits(db, languageFilter);
+  if (prunableCount === 0) return;
+
+  db.prepare(`
+    DELETE FROM semantic_objc_unit_files
+    WHERE EXISTS (
+      SELECT 1 FROM semantic_objc_prunable_units p
+      WHERE p.unit_id = semantic_objc_unit_files.unit_id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM semantic_objc_seen_units s
+        WHERE s.unit_id = semantic_objc_unit_files.unit_id
+      )
+  `).run();
+  db.prepare(`
+    DELETE FROM semantic_objc_node_ownership
+    WHERE EXISTS (
+      SELECT 1 FROM semantic_objc_prunable_units p
+      WHERE p.unit_id = semantic_objc_node_ownership.unit_id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM semantic_objc_seen_units s
+        WHERE s.unit_id = semantic_objc_node_ownership.unit_id
+      )
+  `).run();
+  db.prepare(`
+    DELETE FROM semantic_objc_units
+    WHERE EXISTS (
+      SELECT 1 FROM semantic_objc_prunable_units p
+      WHERE p.unit_id = semantic_objc_units.unit_id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM semantic_objc_seen_units s
+        WHERE s.unit_id = semantic_objc_units.unit_id
+      )
+  `).run();
+}
+
+function populatePrunableSemanticObjcUnits(db: SqliteDatabase, languageFilter: string[]): number {
+  const exts = semanticObjcPrimaryExtensionsForLanguages(languageFilter);
+  if (exts === null) {
+    return db.prepare(`
+      INSERT OR IGNORE INTO semantic_objc_prunable_units (unit_id)
+      SELECT unit_id FROM semantic_objc_units
+    `).run().changes;
+  }
+  if (exts.size === 0) return 0;
+
+  const rows = db.prepare(`
+    SELECT DISTINCT unit_id, file_path AS filePath
+    FROM semantic_objc_unit_files
+    WHERE role = 'primary'
+  `).all() as Array<{ unit_id: string; filePath: string }>;
+
+  const insertPrunableUnit = db.prepare('INSERT OR IGNORE INTO semantic_objc_prunable_units (unit_id) VALUES (?)');
+  let inserted = 0;
+  for (const row of rows) {
+    const ext = path.extname(row.filePath).slice(1).toLowerCase();
+    if (exts.has(ext)) {
+      inserted += insertPrunableUnit.run(row.unit_id).changes;
+    }
+  }
+  return inserted;
+}
+
+function semanticObjcPrimaryExtensionsForLanguages(languageFilter: string[]): Set<string> | null {
+  if (languageFilter.length === 0) return null;
+
+  const exts = new Set<string>();
+  for (const lang of languageFilter) {
+    switch (lang) {
+      case 'objc':
+        exts.add('m');
+        exts.add('mm');
+        break;
+      case 'swift':
+        exts.add('swift');
+        break;
+      case 'c':
+        exts.add('c');
+        break;
+      case 'cpp':
+      case 'cxx':
+        exts.add('cc');
+        exts.add('cpp');
+        exts.add('cxx');
+        exts.add('mm');
+        break;
+      default:
+        break;
+    }
+  }
+  return exts;
 }
 
 export function canonicaliseSymPath(
