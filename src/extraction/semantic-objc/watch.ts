@@ -10,8 +10,9 @@ import {
 import type { SemanticObjcStatus } from './state';
 import { spawnSemanticObjcSnapshot } from './spawner';
 import {
+  evaluateSemanticObjcSnapshotReadiness,
   isSemanticObjcSnapshotPublicationGateError,
-  waitForSemanticObjcSnapshotStability,
+  semanticObjcSnapshotNotReadyReason,
   type SemanticObjcSnapshotRecord,
 } from './snapshot';
 
@@ -36,6 +37,9 @@ export class SemanticObjcIndexStoreWatcher {
   private snapshotRetryAttempt = 0;
   private snapshotRaceRetries = 0;
   private lastIndexStoreSnapshot: IndexStoreSnapshot | null = null;
+  private reconcileInFlight = false;
+  private rerunAfterCurrent = false;
+  private stopped = false;
   private readonly scheduler: SemanticObjcIdleScheduler;
 
   constructor(private readonly opts: SemanticObjcIndexStoreWatcherOptions) {
@@ -49,6 +53,7 @@ export class SemanticObjcIndexStoreWatcher {
   }
 
   start(): boolean {
+    this.stopped = false;
     const storePath = this.opts.config.storePath;
     if (!this.opts.config.enabled || !this.opts.config.watchIndexStore || !storePath) return false;
     try {
@@ -61,6 +66,8 @@ export class SemanticObjcIndexStoreWatcher {
   }
 
   stop(): void {
+    this.stopped = true;
+    this.rerunAfterCurrent = false;
     if (this.pendingTimer) {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
@@ -83,10 +90,13 @@ export class SemanticObjcIndexStoreWatcher {
   hasPendingWork(): boolean {
     return this.pendingTimer !== null ||
       this.quiescenceRetryTimer !== null ||
+      this.reconcileInFlight ||
+      this.rerunAfterCurrent ||
       this.scheduler.status() !== 'fresh';
   }
 
   notifyChanged(): void {
+    if (this.stopped) return;
     if (this.pendingTimer) clearTimeout(this.pendingTimer);
     if (this.quiescenceRetryTimer) {
       clearTimeout(this.quiescenceRetryTimer);
@@ -96,6 +106,10 @@ export class SemanticObjcIndexStoreWatcher {
     this.snapshotWaitAbort = null;
     this.snapshotRetryAttempt = 0;
     this.snapshotRaceRetries = 0;
+    if (this.reconcileInFlight) {
+      this.rerunAfterCurrent = true;
+      return;
+    }
     this.pendingTimer = setTimeout(() => {
       this.pendingTimer = null;
       void this.runAfterQuiescence();
@@ -108,10 +122,17 @@ export class SemanticObjcIndexStoreWatcher {
   }
 
   private async runAfterQuiescence(force = false): Promise<void> {
+    if (this.reconcileInFlight) {
+      this.rerunAfterCurrent = true;
+      return;
+    }
     const storePath = this.opts.config.storePath;
-    if (!storePath) return;
+    if (!storePath || this.stopped) return;
+
+    this.reconcileInFlight = true;
     try {
       const indexStoreSnapshot = await waitForIndexStoreQuiescence(storePath, this.opts.config.quiescence);
+      if (this.rerunAfterCurrent || this.stopped) return;
       if (
         !force &&
         this.lastIndexStoreSnapshot &&
@@ -125,35 +146,37 @@ export class SemanticObjcIndexStoreWatcher {
         this.opts.onState?.('queued', 'semantic-snapshot-wait');
         const controller = new AbortController();
         this.snapshotWaitAbort = controller;
-        const outcome = await waitForSemanticObjcSnapshotStability({
-          sample: snapshot,
-          sampleIntervalMs: this.opts.config.quiescence.sampleIntervalMs,
-          stableSamples: this.opts.config.quiescence.stableSamples,
-          maxWaitMs: this.opts.config.quiescence.maxWaitMs,
-          signal: controller.signal,
-        });
-        if (this.snapshotWaitAbort === controller) {
-          this.snapshotWaitAbort = null;
+        let semanticSnapshot: SemanticObjcSnapshotRecord;
+        try {
+          semanticSnapshot = await snapshot(controller.signal);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          const reason = err instanceof Error ? err.message : String(err);
+          this.opts.onState?.('stale', `semantic-snapshot-helper-failed:${reason}`);
+          this.scheduleQuiescenceRetry(true);
+          return;
+        } finally {
+          if (this.snapshotWaitAbort === controller) {
+            this.snapshotWaitAbort = null;
+          }
         }
-        if (outcome.status !== 'stable') {
-          if (outcome.status === 'aborted') return;
-          this.opts.onState?.(
-            'stale',
-            outcome.status === 'timeout'
-              ? outcome.reason
-              : `semantic-snapshot-${outcome.status}:${outcome.reason}`
-          );
+        const readiness = evaluateSemanticObjcSnapshotReadiness(semanticSnapshot);
+        if (!readiness.ready) {
+          const reason = semanticObjcSnapshotNotReadyReason(readiness.reason);
+          this.opts.onState?.('stale', reason);
           this.scheduleQuiescenceRetry(true);
           return;
         }
         this.snapshotRetryAttempt = 0;
       }
+      if (this.rerunAfterCurrent || this.stopped) return;
       const result = await this.scheduler.enqueue(this.opts.onSemanticDelta);
       if (result.ran) {
         this.snapshotRaceRetries = 0;
         this.lastIndexStoreSnapshot = indexStoreSnapshot;
       }
     } catch (err) {
+      if (this.stopped) return;
       if (isSemanticObjcSnapshotPublicationGateError(err)) {
         const reason = err instanceof Error ? err.message : 'semantic-snapshot-publication-gate';
         this.opts.onState?.('queued', reason);
@@ -163,6 +186,16 @@ export class SemanticObjcIndexStoreWatcher {
       const reason = err instanceof Error ? err.message : String(err);
       this.opts.onState?.('stale', reason);
       this.scheduleQuiescenceRetry(false);
+    } finally {
+      this.reconcileInFlight = false;
+      if (this.rerunAfterCurrent && !this.stopped) {
+        this.rerunAfterCurrent = false;
+        this.pendingTimer = setTimeout(() => {
+          this.pendingTimer = null;
+          void this.runAfterQuiescence();
+        }, this.opts.config.quiescence.sampleIntervalMs);
+        this.pendingTimer.unref?.();
+      }
     }
   }
 

@@ -23,10 +23,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Semantic ObjC enrichment no longer treats a quiet IndexStore directory as proof
-  that Xcode indexing is semantically complete. It now waits for stable helper
-  snapshots, rejects dumps that race with IndexStore writes, keeps the previous
-  stable graph usable while newer work is pending, and reports stable/pending
-  snapshot state in status output.
+  that Xcode indexing is semantically complete. It now checks helper snapshot
+  readiness before merging, rejects dumps that race with IndexStore writes,
+  keeps the previous stable graph usable while newer work is pending, and
+  reports stable/pending snapshot state in status output.
+- Semantic ObjC watch mode now avoids repeatedly launching expensive helper snapshots before each merge, so large Xcode projects no longer get stuck in snapshot timeouts just because one helper readiness check takes longer than the default wait window.
 - Semantic ObjC watch mode now backs off when Xcode's IndexStore snapshots keep timing out, cancels obsolete helper probes when new changes arrive, and includes snapshot capture times in status output so long-running indexing is easier to diagnose.
 - A semantic-enabled MCP launcher no longer attaches to an already-running
   shared daemon that was started without Semantic ObjC watching. The daemon

@@ -240,7 +240,7 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
     }
   });
 
-  it('does not enqueue semantic work when directory is quiet but semantic snapshots keep changing', async () => {
+  it('enqueues semantic work after one ready snapshot without waiting for repeated stable fingerprints', async () => {
     vi.useFakeTimers();
     const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
     fs.mkdirSync(storePath, { recursive: true });
@@ -279,22 +279,23 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
 
     try {
       watcher.notifyChanged();
-      await vi.advanceTimersByTimeAsync(20);
-      expect(runs).toBe(0);
+      await vi.runAllTimersAsync();
+      expect(runs).toBe(1);
+      expect(snapshotIndex).toBe(1);
       expect(states).toContain('queued:semantic-snapshot-wait');
-      expect(states.some((state) => state.startsWith('stale:semantic-snapshot-timeout'))).toBe(true);
+      expect(states).toContain('fresh');
+      expect(states.some((state) => state.startsWith('stale:semantic-snapshot-timeout'))).toBe(false);
     } finally {
       watcher.stop();
       vi.useRealTimers();
     }
   });
 
-  it('backs off repeated semantic snapshot stability retries', async () => {
+  it('backs off repeated semantic snapshot readiness retries', async () => {
     vi.useFakeTimers();
     const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
     fs.mkdirSync(storePath, { recursive: true });
     fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
-    let snapshotIndex = 0;
     const states: string[] = [];
     const config = parseSemanticObjcWatchConfig({
       enabled: true,
@@ -316,26 +317,26 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
         languageFilter: ['objc'],
         includeSystem: false,
         explicitOutputUnits: true,
-        unitCount: 1,
-        unitFileCount: 1,
-        sourceMembershipCount: 1,
-        aggregateFingerprint: `fp-${snapshotIndex++}`,
+        unitCount: 0,
+        unitFileCount: 0,
+        sourceMembershipCount: 0,
+        aggregateFingerprint: 'not-ready',
       }),
       onState: (status, reason) => states.push(reason ? `${status}:${reason}` : status),
-      onSemanticDelta: async () => { throw new Error('should not run while snapshots change'); },
+      onSemanticDelta: async () => { throw new Error('should not run while snapshot is not ready'); },
     });
 
     try {
       watcher.notifyChanged();
       await vi.advanceTimersByTimeAsync(20);
-      const waitsAfterFirstTimeout = states.filter((state) => state === 'queued:semantic-snapshot-wait').length;
-      expect(waitsAfterFirstTimeout).toBe(1);
+      const waitsAfterFirstNotReady = states.filter((state) => state === 'queued:semantic-snapshot-wait').length;
+      expect(waitsAfterFirstNotReady).toBe(1);
 
       await vi.advanceTimersByTimeAsync(900);
-      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstTimeout);
+      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstNotReady);
 
       await vi.advanceTimersByTimeAsync(200);
-      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstTimeout + 1);
+      expect(states.filter((state) => state === 'queued:semantic-snapshot-wait').length).toBe(waitsAfterFirstNotReady + 1);
     } finally {
       watcher.stop();
       vi.useRealTimers();
@@ -385,6 +386,80 @@ describe('Semantic ObjC watch configuration and scheduling', () => {
       expect(runs).toBe(1);
       expect(states).toContain('queued:semantic-snapshot-wait');
       expect(states).toContain('fresh');
+    } finally {
+      watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('serializes overlapping semantic snapshot waits and coalesces a rerun', async () => {
+    vi.useFakeTimers();
+    const storePath = path.join(tempDir, 'Index.noindex', 'DataStore');
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.writeFileSync(path.join(storePath, 'unit'), 'abc');
+    const config = parseSemanticObjcWatchConfig({
+      enabled: true,
+      watchIndexStore: true,
+      storePath,
+      helperPath: '/tmp/codegraph-xchelper',
+    });
+    config.quiescence = { sampleIntervalMs: 1, stableSamples: 1, maxWaitMs: 20 };
+    let activeSnapshots = 0;
+    let maxActiveSnapshots = 0;
+    let snapshotCalls = 0;
+    let runs = 0;
+    const releaseSnapshots: Array<() => void> = [];
+    const snapshot = {
+      t: 'snapshot' as const,
+      helperVersion: 'codegraph-xchelper 1.1.1',
+      semanticDeltaVersion: 1,
+      unitFingerprintAlgorithm: 'index-unit-v1',
+      recordKinds: ['unit', 'unit_file', 'sym', 'rel', 'ref'],
+      sourceMembership: true,
+      languageFilter: ['objc'],
+      includeSystem: false,
+      explicitOutputUnits: true,
+      unitCount: 1,
+      unitFileCount: 1,
+      sourceMembershipCount: 1,
+      aggregateFingerprint: 'stable',
+    };
+    const watcher = new SemanticObjcIndexStoreWatcher({
+      config,
+      isIdle: () => true,
+      snapshot: async () => {
+        snapshotCalls++;
+        activeSnapshots++;
+        maxActiveSnapshots = Math.max(maxActiveSnapshots, activeSnapshots);
+        await new Promise<void>((resolve) => releaseSnapshots.push(resolve));
+        activeSnapshots--;
+        return snapshot;
+      },
+      onSemanticDelta: async () => { runs++; },
+    });
+
+    try {
+      watcher.notifyChanged();
+      await vi.advanceTimersByTimeAsync(2);
+      expect(snapshotCalls).toBe(1);
+
+      watcher.notifyChanged();
+      watcher.notifyChanged();
+      expect(snapshotCalls).toBe(1);
+      expect(maxActiveSnapshots).toBe(1);
+
+      releaseSnapshots.shift()?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runs).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(3);
+      expect(snapshotCalls).toBe(2);
+      expect(maxActiveSnapshots).toBe(1);
+
+      releaseSnapshots.shift()?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runs).toBe(1);
+      expect(maxActiveSnapshots).toBe(1);
     } finally {
       watcher.stop();
       vi.useRealTimers();
